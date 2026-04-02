@@ -1,0 +1,31 @@
+#!/bin/bash
+# Convenience script: Run MOLA LiDAR odometry from an Ouster PCAP recording.
+#
+# Usage:
+#   mola-lo-gui-ouster-pcap <PCAP_FILE> <METADATA_JSON>
+#
+# Example:
+#   mola-lo-gui-ouster-pcap /path/to/capture.pcap /path/to/metadata.json
+
+set -e
+
+if [ "$#" -lt 2 ]; then
+    echo "Usage: $(basename "$0") <PCAP_FILE> <METADATA_JSON>"
+    echo ""
+    echo "Example:"
+    echo "  $(basename "$0") /path/to/capture.pcap /path/to/metadata.json"
+    exit 1
+fi
+
+export OUSTER_PCAP="$1"
+export OUSTER_META="$2"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LAUNCH_DIR="${SCRIPT_DIR}/../share/mola_input_ouster/mola-cli-launchs"
+
+# If not installed, try relative path from source tree
+if [ ! -d "$LAUNCH_DIR" ]; then
+    LAUNCH_DIR="${SCRIPT_DIR}/../mola-cli-launchs"
+fi
+
+exec mola-cli -c "${LAUNCH_DIR}/lidar_odometry_ouster_pcap.yaml"

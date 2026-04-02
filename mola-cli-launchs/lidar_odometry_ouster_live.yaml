@@ -1,0 +1,79 @@
+# -----------------------------------------------------------------------------
+#                        SLAM system definition for MOLA
+# This file defines:
+# Direct input from a live Ouster LiDAR sensor (no ROS required),
+# LiDAR odometry, state estimation, and the MOLA visualizer.
+# -----------------------------------------------------------------------------
+# Usage:
+#   OUSTER_HOSTNAME=os-122xxxxxxxxx.local mola-cli \
+#       -c lidar_odometry_ouster_live.yaml
+# -----------------------------------------------------------------------------
+
+modules:
+  # =====================
+  # MolaViz
+  # =====================
+  - name: viz
+    type: mola::MolaViz
+    enabled: ${MOLA_WITH_GUI|true}
+    verbosity_level: "${MOLA_VERBOSITY_MOLA_VIZ|INFO}"
+    params: ~ # none
+
+  # =====================
+  # Ouster Direct Input
+  # =====================
+  - name: ouster_input
+    type: mola::OusterDirectInput
+    execution_rate: 50 # Hz (only affects spinOnce diagnostics in live mode)
+    verbosity_level: "${MOLA_VERBOSITY_OUSTER|INFO}"
+
+    gui_preview_sensors:
+      - raw_sensor_label: "${MOLA_LIDAR_NAME|lidar}"
+        decimation: 1
+        enabled: ${MOLA_WITH_GUI|true}
+        win_pos: 5 5 400 400
+
+    params:
+      sensor_hostname: "${OUSTER_HOSTNAME}"
+      udp_dest: "${OUSTER_UDP_DEST|}"
+      lidar_port: ${OUSTER_LIDAR_PORT|0}
+      imu_port: ${OUSTER_IMU_PORT|0}
+
+      lidar_mode: "${OUSTER_LIDAR_MODE|MODE_1024x10}"
+      timestamp_mode: "${OUSTER_TIMESTAMP_MODE|TIME_FROM_PTP_1588}"
+
+      lidar_sensor_label: "${MOLA_LIDAR_NAME|lidar}"
+      imu_sensor_label: "${MOLA_IMU_NAME|imu}"
+
+      # Pose of the Ouster sensor housing on the vehicle frame.
+      # The factory-calibrated lidar↔sensor and imu↔sensor intrinsic
+      # transforms are read from the sensor metadata and composed
+      # automatically with this mounting pose.
+      sensor_mounting_pose: "${SENSOR_POSE_X|0} ${SENSOR_POSE_Y|0} ${SENSOR_POSE_Z|0} ${SENSOR_POSE_YAW|0} ${SENSOR_POSE_PITCH|0} ${SENSOR_POSE_ROLL|0}"
+
+      # Optional: manually override individual sensor poses on the vehicle,
+      # bypassing the automatic composition with intrinsic transforms.
+      # lidar_sensor_pose: "${LIDAR_POSE_X|0} ${LIDAR_POSE_Y|0} ${LIDAR_POSE_Z|0} ${LIDAR_POSE_YAW|0} ${LIDAR_POSE_PITCH|0} ${LIDAR_POSE_ROLL|0}"
+      # imu_sensor_pose: "${IMU_POSE_X|0} ${IMU_POSE_Y|0} ${IMU_POSE_Z|0} ${IMU_POSE_YAW|0} ${IMU_POSE_PITCH|0} ${IMU_POSE_ROLL|0}"
+
+  # =====================
+  # LIDAR ODOMETRY
+  # =====================
+  - name: lidar_odom
+    type: mola::LidarOdometry
+    verbosity_level: "${MOLA_VERBOSITY_MOLA_LO|INFO}"
+    raw_data_source: "ouster_input"
+    # This includes here a whole block "params: (...)"
+    # with the LIDAR-Odometry pipeline configuration:
+    params: "${MOLA_ODOMETRY_PIPELINE_YAML|../pipelines/lidar3d-default.yaml}"
+
+  # =====================
+  # State Estimation
+  # =====================
+  - name: state_estimation
+    type: "${MOLA_STATE_ESTIMATOR|mola::state_estimation_simple::StateEstimationSimple}"
+    verbosity_level: "${MOLA_VERBOSITY_MOLA_STATE_ESTIMATOR|INFO}"
+    raw_data_source: "ouster_input"
+
+    # This includes here a whole block "params: (...)":
+    params: "${MOLA_STATE_ESTIMATOR_YAML|../state-estimator-params/state-estimation-simple.yaml}"

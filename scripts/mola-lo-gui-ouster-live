@@ -1,0 +1,44 @@
+#!/bin/bash
+# Convenience script: Run MOLA LiDAR odometry live from an Ouster sensor.
+#
+# Usage:
+#   mola-lo-gui-ouster-live <SENSOR_HOSTNAME>
+#
+# Example:
+#   mola-lo-gui-ouster-live os-122xxxxxxxxx.local
+#
+# Environment variables (all optional):
+#   OUSTER_LIDAR_MODE       (default: MODE_1024x10)
+#   OUSTER_TIMESTAMP_MODE   (default: TIME_FROM_PTP_1588)
+#   OUSTER_UDP_DEST         (default: auto-detect)
+#   MOLA_LIDAR_NAME         (default: lidar)
+#   MOLA_IMU_NAME           (default: imu)
+#   LIDAR_POSE_{X,Y,Z,YAW,PITCH,ROLL}  (default: 0)
+#   IMU_POSE_{X,Y,Z,YAW,PITCH,ROLL}    (default: 0)
+#   MOLA_DESKEW_METHOD      (default: not set, use LO defaults)
+
+set -e
+
+if [ "$#" -lt 1 ]; then
+    echo "Usage: $(basename "$0") <SENSOR_HOSTNAME>"
+    echo ""
+    echo "Example:"
+    echo "  $(basename "$0") os-122xxxxxxxxx.local"
+    echo ""
+    echo "For LIO (with IMU deskewing):"
+    echo "  MOLA_DESKEW_METHOD=MotionCompensationMethod::IMU \\"
+    echo "  $(basename "$0") os-122xxxxxxxxx.local"
+    exit 1
+fi
+
+export OUSTER_HOSTNAME="$1"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LAUNCH_DIR="${SCRIPT_DIR}/../share/mola_input_ouster/mola-cli-launchs"
+
+# If not installed, try relative path from source tree
+if [ ! -d "$LAUNCH_DIR" ]; then
+    LAUNCH_DIR="${SCRIPT_DIR}/../mola-cli-launchs"
+fi
+
+exec mola-cli -c "${LAUNCH_DIR}/lidar_odometry_ouster_live.yaml"
