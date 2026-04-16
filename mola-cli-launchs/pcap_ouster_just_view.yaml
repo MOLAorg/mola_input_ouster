@@ -1,0 +1,57 @@
+# -----------------------------------------------------------------------------
+#                        SLAM system definition for MOLA
+# This file defines:
+# PCAP replay of a recorded Ouster capture (no ROS required),
+# and the MOLA Visualizer — no odometry or mapping.
+# Use this to inspect a recorded dataset before running full SLAM.
+# -----------------------------------------------------------------------------
+# Usage:
+#   OUSTER_PCAP=/path/to/capture.pcap \
+#   OUSTER_META=/path/to/metadata.json \
+#   mola-cli -c $(mola-dir mola_input_ouster)/mola-cli-launchs/pcap_ouster_just_view.yaml
+#
+# Or via the convenience script:
+#   mola-lo-gui-ouster-pcap /path/to/capture.pcap /path/to/metadata.json
+#
+# Optional environment variables:
+#   MOLA_TIME_WARP    Replay speed multiplier (default: 1.0, use 0 to go as
+#                     fast as possible)
+#   MOLA_LIDAR_NAME   Sensor label (default: lidar)
+#   SENSOR_POSE_{X,Y,Z,YAW,PITCH,ROLL}  Mounting pose on vehicle (default: 0)
+# -----------------------------------------------------------------------------
+
+modules:
+  # =====================
+  # Visualizer
+  # =====================
+  - name: viz
+    type: mola::MolaViz
+    enabled: ${MOLA_WITH_GUI|true}
+    verbosity_level: "${MOLA_VERBOSITY_MOLA_VIZ|INFO}"
+    params: ~ # none
+
+  # =====================
+  # Ouster PCAP Replay
+  # =====================
+  - name: ouster_input
+    type: mola::OusterDirectInput
+    execution_rate: 50  # Hz — drives pcapSpinOnce() in replay mode
+    verbosity_level: "${MOLA_VERBOSITY_OUSTER|INFO}"
+
+    gui_preview_sensors:
+      - raw_sensor_label: "${MOLA_LIDAR_NAME|lidar}"
+        decimation: 1
+        enabled: ${MOLA_WITH_GUI|true}
+        win_pos: 5 5 800 600
+
+    params:
+      pcap_file:     "${OUSTER_PCAP}"
+      metadata_json: "${OUSTER_META}"
+
+      time_warp_scale: ${MOLA_TIME_WARP|1.0}
+
+      lidar_sensor_label: "${MOLA_LIDAR_NAME|lidar}"
+      imu_sensor_label:   "${MOLA_IMU_NAME|imu}"
+
+      # Pose of the Ouster sensor housing on the vehicle frame.
+      sensor_mounting_pose: "${SENSOR_POSE_X|0} ${SENSOR_POSE_Y|0} ${SENSOR_POSE_Z|0} ${SENSOR_POSE_YAW|0} ${SENSOR_POSE_PITCH|0} ${SENSOR_POSE_ROLL|0}"

@@ -31,13 +31,19 @@
 #include <mrpt/obs/CObservationPointCloud.h>
 #include <mrpt/system/filesystem.h>
 
-// Ouster SDK — client:
+// Ouster SDK (0.16+):
+#include <ouster/cartesian.h>
 #include <ouster/client.h>
 #include <ouster/lidar_scan.h>
-#include <ouster/types.h>
-
-// Ouster SDK — pcap (only needed for PCAP replay):
 #include <ouster/os_pcap.h>
+#include <ouster/sensor_packet_source.h>
+#include <ouster/types.h>
+#include <ouster/xyzlut.h>
+
+// Convenience aliases for the SDK 0.16 namespace structure
+namespace sc  = ouster::sdk::core;
+namespace ss  = ouster::sdk::sensor;
+namespace spc = ouster::sdk::pcap;
 
 #include <Eigen/Core>
 #include <chrono>
@@ -129,34 +135,35 @@ mrpt::poses::CPose3D mat4dToPose(const Eigen::Matrix<double, 4, 4>& m)
 // ============================================================================
 struct OusterDirectInput::OusterState
 {
-  // Live sensor connection (null in pcap mode)
-  std::shared_ptr<ouster::sensor::client> client;
+  // Live sensor packet source (null in pcap mode)
+  std::unique_ptr<ss::SensorPacketSource> packetSource;
 
   // Metadata (populated in both modes)
-  ouster::sensor::sensor_info info;
+  sc::SensorInfo info;
 
-  // Packet format (derived from sensor_info)
-  std::unique_ptr<ouster::sensor::packet_format> pf;
+  // Packet format (derived from SensorInfo); shared_ptr because Packet::format
+  // is also a shared_ptr and both packets hold a reference to the same object.
+  std::shared_ptr<sc::PacketFormat> pf;
 
   // Batching packets into full scans
-  std::unique_ptr<ouster::ScanBatcher> batcher;
-  std::unique_ptr<ouster::LidarScan>   scan;
+  std::unique_ptr<sc::ScanBatcher> batcher;
+  std::unique_ptr<sc::LidarScan>   scan;
 
   // Lookup table for converting range -> XYZ
-  ouster::XYZLut xyzLut;
+  sc::XYZLut xyzLut;
 
-  // Raw packet buffers
-  std::vector<uint8_t> lidarBuf;
-  std::vector<uint8_t> imuBuf;
+  // Typed packet objects (SDK 0.16: ScanBatcher takes Packet&, not uint8_t*)
+  sc::LidarPacket lidarPkt;
+  sc::ImuPacket   imuPkt;
 
   // Scan dimensions
   int w = 0;  // columns per revolution
   int h = 0;  // pixels per column (channels)
 
   // PCAP replay handle (null in live mode)
-  std::shared_ptr<ouster::sensor_utils::playback_handle> pcapHandle;
-  int                                                    pcapLidarPort = 0;
-  int                                                    pcapImuPort   = 0;
+  std::shared_ptr<spc::PlaybackHandle> pcapHandle;
+  int                                  pcapLidarPort = 0;
+  int                                  pcapImuPort   = 0;
 
   // Reusable scratch buffer for skipping unknown packets
   std::vector<uint8_t> scratchBuf;
@@ -191,7 +198,7 @@ void OusterDirectInput::onQuit()
   // Clean up PCAP handle
   if (ousterState_ && ousterState_->pcapHandle)
   {
-    ouster::sensor_utils::replay_uninitialize(*(ousterState_->pcapHandle));
+    spc::replay_uninitialize(*(ousterState_->pcapHandle));
     ousterState_->pcapHandle.reset();
   }
 }
@@ -320,23 +327,38 @@ void OusterDirectInput::initLiveMode()
 
   MRPT_LOG_INFO_STREAM("Connecting to Ouster sensor at '" << params_.sensor_hostname << "' ...");
 
-  auto ld_mode = ouster::sensor::lidar_mode_of_string(params_.lidar_mode);
-  auto ts_mode = ouster::sensor::timestamp_mode_of_string(params_.timestamp_mode);
-
-  ASSERTMSG_(ld_mode.has_value(), "Invalid lidar_mode: '"s + params_.lidar_mode + "'"s);
-  ASSERTMSG_(ts_mode.has_value(), "Invalid timestamp_mode: '"s + params_.timestamp_mode + "'"s);
-
-  ousterState_->client = ouster::sensor::init_client(
-      params_.sensor_hostname, params_.udp_dest, ld_mode.value(), ts_mode.value(),
-      params_.lidar_port, params_.imu_port);
+  auto ld_mode = sc::lidar_mode_of_string(params_.lidar_mode);
+  auto ts_mode = sc::timestamp_mode_of_string(params_.timestamp_mode);
 
   ASSERTMSG_(
-      ousterState_->client,
-      "Failed to connect to Ouster sensor at '"s + params_.sensor_hostname + "'"s);
+      ld_mode != sc::LidarMode::UNSPECIFIED, "Invalid lidar_mode: '"s + params_.lidar_mode + "'"s);
+  ASSERTMSG_(
+      ts_mode != sc::TimestampMode::UNSPECIFIED,
+      "Invalid timestamp_mode: '"s + params_.timestamp_mode + "'"s);
 
-  // Retrieve metadata
-  auto metadata_str  = ouster::sensor::get_metadata(*(ousterState_->client));
-  ousterState_->info = ouster::sensor::parse_metadata(metadata_str);
+  // Build a SensorConfig with the desired resolution / timestamp mode
+  sc::SensorConfig cfg;
+  cfg.lidar_mode     = ld_mode;
+  cfg.timestamp_mode = ts_mode;
+  if (!params_.udp_dest.empty()) cfg.udp_dest = params_.udp_dest;
+  if (params_.lidar_port) cfg.udp_port_lidar = static_cast<uint16_t>(params_.lidar_port);
+  if (params_.imu_port) cfg.udp_port_imu = static_cast<uint16_t>(params_.imu_port);
+
+  // Create a SensorPacketSource — replaces deprecated init_client
+  ousterState_->packetSource = std::make_unique<ss::SensorPacketSource>(
+      params_.sensor_hostname,
+      [&cfg, this](ss::SensorPacketSourceOptions& opts)
+      {
+        opts.sensor_config = {cfg};
+        if (!params_.udp_dest.empty()) opts.no_auto_udp_dest = true;
+      });
+
+  // Retrieve metadata from the connected sensor
+  const auto& infos = ousterState_->packetSource->sensor_info();
+  ASSERTMSG_(
+      !infos.empty() && infos[0],
+      "Failed to retrieve metadata from Ouster sensor at '"s + params_.sensor_hostname + "'"s);
+  ousterState_->info = *(infos[0]);
 
   MRPT_LOG_INFO_STREAM(
       "Connected to Ouster sensor. Product: " << ousterState_->info.prod_line
@@ -356,14 +378,14 @@ void OusterDirectInput::initPcapMode()
   ASSERTMSG_(ifs.good(), "Cannot open metadata JSON file.");
   std::string metadata_str((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
 
-  ousterState_->info = ouster::sensor::parse_metadata(metadata_str);
+  ousterState_->info = sc::SensorInfo(metadata_str);
 
   MRPT_LOG_INFO_STREAM(
       "Loaded Ouster metadata. Product: " << ousterState_->info.prod_line
                                           << "  SN: " << ousterState_->info.sn);
 
   // Open pcap file for stepwise playback
-  ousterState_->pcapHandle = ouster::sensor_utils::replay_initialize(params_.pcap_file);
+  ousterState_->pcapHandle = spc::replay_initialize(params_.pcap_file);
   ASSERTMSG_(ousterState_->pcapHandle, "Failed to open PCAP file.");
 
   // Determine the UDP ports used for LiDAR and IMU data.
@@ -390,23 +412,25 @@ void OusterDirectInput::setupOusterFromInfo()
   MRPT_LOG_INFO_FMT("Ouster scan format: %d x %d (cols x rows)", ousterState_->w, ousterState_->h);
 
   // Packet format
-  ousterState_->pf =
-      std::make_unique<ouster::sensor::packet_format>(ouster::sensor::get_format(info));
+  ousterState_->pf = std::make_shared<sc::PacketFormat>(sc::get_format(info));
 
   // Scan batcher
-  ousterState_->batcher = std::make_unique<ouster::ScanBatcher>(info);
+  ousterState_->batcher = std::make_unique<sc::ScanBatcher>(info);
 
   // Allocate a LidarScan
-  ousterState_->scan = std::make_unique<ouster::LidarScan>(
+  ousterState_->scan = std::make_unique<sc::LidarScan>(
       ousterState_->w, ousterState_->h, info.format.udp_profile_lidar);
 
   // XYZ lookup table
-  ousterState_->xyzLut = ouster::make_xyz_lut(info);
+  ousterState_->xyzLut = sc::make_xyz_lut(info, /*use_extrinsics=*/false);
 
-  // Allocate packet buffers
+  // Allocate typed packet objects; share the PacketFormat with each packet
+  // so ScanBatcher can validate them (SDK 0.16 requirement).
   const auto& pf = *(ousterState_->pf);
-  ousterState_->lidarBuf.resize(pf.lidar_packet_size + 1);
-  ousterState_->imuBuf.resize(pf.imu_packet_size + 1);
+  ousterState_->lidarPkt        = sc::LidarPacket(pf.lidar_packet_size);
+  ousterState_->imuPkt          = sc::ImuPacket(pf.imu_packet_size);
+  ousterState_->lidarPkt.format = ousterState_->pf;
+  ousterState_->imuPkt.format   = ousterState_->pf;
 
   // ---- Resolve observation sensorPose from intrinsic transforms ----
   //
@@ -482,7 +506,7 @@ void OusterDirectInput::setupOusterFromInfo()
 // This is consistent with how BridgeROS2 / mrpt::ros2bridge sets sensorPose.
 // ============================================================================
 mrpt::obs::CObservationPointCloud::Ptr OusterDirectInput::scanToObservation(
-    const ouster::LidarScan& scan)
+    const sc::LidarScan& scan)
 {
   const ProfilerEntry tleg(profiler_, "scanToObservation");
 
@@ -492,11 +516,12 @@ mrpt::obs::CObservationPointCloud::Ptr OusterDirectInput::scanToObservation(
 
   // Convert range data to XYZ using the precomputed lookup table.
   // cartesianT() returns an Eigen::Array<double, -1, 3> of shape (W*H, 3).
-  auto cloud = ouster::cartesianT(scan, ousterState_->xyzLut);
+  auto cloud =
+      sc::cartesianT<double>(scan, ousterState_->xyzLut.direction, ousterState_->xyzLut.offset);
 
   // Get the range field to filter out invalid (zero-range) points.
   // range is a 2D Eigen array of shape (H, W).
-  auto range = scan.field<uint32_t>(ouster::sensor::ChanField::RANGE);
+  auto range = scan.field<uint32_t>(sc::ChanField::RANGE);
 
   // Build MRPT point cloud
   auto pts = mrpt::maps::CSimplePointsMap::Create();
@@ -609,56 +634,54 @@ void OusterDirectInput::receiverThreadFunc()
 {
   MRPT_LOG_INFO("Ouster receiver thread started.");
 
-  auto&       cli     = *(ousterState_->client);
-  const auto& pf      = *(ousterState_->pf);
-  auto&       batcher = *(ousterState_->batcher);
-  auto&       scan    = *(ousterState_->scan);
+  auto& src     = *(ousterState_->packetSource);
+  auto& batcher = *(ousterState_->batcher);
+  auto& scan    = *(ousterState_->scan);
 
   while (receiverRunning_ && !requestedShutdown())
   {
     try
     {
-      const auto st = ouster::sensor::poll_client(cli, /*timeout_sec=*/1);
+      // get_packet blocks for up to 1 s, then returns a POLL_TIMEOUT event.
+      const auto event = src.get_packet(/*timeout_sec=*/1.0);
 
-      if (st & ouster::sensor::CLIENT_ERROR)
+      if (event.type == ss::ClientEvent::ERR)
       {
-        MRPT_LOG_ERROR("Ouster poll_client returned CLIENT_ERROR.");
+        MRPT_LOG_ERROR("Ouster SensorPacketSource returned ERR.");
         break;
       }
-      if (st & ouster::sensor::EXIT)
+      if (event.type == ss::ClientEvent::EXIT)
       {
-        MRPT_LOG_INFO("Ouster poll_client returned EXIT.");
+        MRPT_LOG_INFO("Ouster SensorPacketSource returned EXIT.");
         break;
       }
-
-      // ---- LiDAR data ----
-      if (st & ouster::sensor::LIDAR_DATA)
+      if (event.type == ss::ClientEvent::POLL_TIMEOUT)
       {
-        if (ouster::sensor::read_lidar_packet(cli, ousterState_->lidarBuf.data(), pf))
-        {
-          // Feed packet to batcher; returns true when a
-          // full scan is assembled.
-          if (batcher(ousterState_->lidarBuf.data(), scan))
-          {
-            auto obs = scanToObservation(scan);
-            if (obs && obs->pointcloud && obs->pointcloud->size() > 0)
-            {
-              sendObservationsToFrontEnds(obs);
-            }
-          }
-        }
+        continue;  // normal timeout — re-check receiverRunning_
       }
 
-      // ---- IMU data ----
-      if (st & ouster::sensor::IMU_DATA)
+      // event.type == PACKET
+      auto& pkt = const_cast<ss::ClientEvent&>(event).packet();
+      if (pkt.type() == sc::PacketType::Lidar)
       {
-        if (ouster::sensor::read_imu_packet(cli, ousterState_->imuBuf.data(), pf))
+        auto& lidarPkt = static_cast<sc::LidarPacket&>(pkt);
+        // Feed packet to batcher; returns true when a full scan is assembled.
+        if (batcher(lidarPkt, scan))
         {
-          auto obs = imuToObservation(ousterState_->imuBuf.data());
-          if (obs)
+          auto obs = scanToObservation(scan);
+          if (obs && obs->pointcloud && obs->pointcloud->size() > 0)
           {
             sendObservationsToFrontEnds(obs);
           }
+        }
+      }
+      else if (pkt.type() == sc::PacketType::Imu)
+      {
+        auto& imuPkt = static_cast<sc::ImuPacket&>(pkt);
+        auto  obs    = imuToObservation(imuPkt.buf.data());
+        if (obs)
+        {
+          sendObservationsToFrontEnds(obs);
         }
       }
     }
@@ -724,8 +747,8 @@ void OusterDirectInput::pcapSpinOnce()
   bool gotScan = false;
   while (!gotScan && !requestedShutdown())
   {
-    ouster::sensor_utils::packet_info pktInfo;
-    if (!ouster::sensor_utils::next_packet_info(handle, pktInfo))
+    spc::PacketInfo pktInfo;
+    if (!spc::next_packet_info(handle, pktInfo))
     {
       // End of file
       MRPT_LOG_INFO("End of PCAP file reached.");
@@ -736,15 +759,15 @@ void OusterDirectInput::pcapSpinOnce()
     const int  dstPort     = pktInfo.dst_port;
     const auto payloadSize = static_cast<std::size_t>(pktInfo.payload_size);
 
-    if (dstPort == lidarPort && payloadSize <= ousterState_->lidarBuf.size())
+    if (dstPort == lidarPort && payloadSize <= ousterState_->lidarPkt.buf.size())
     {
       // Read lidar packet
-      const auto nRead = ouster::sensor_utils::read_packet(
-          handle, ousterState_->lidarBuf.data(), ousterState_->lidarBuf.size());
+      const auto nRead = spc::read_packet(
+          handle, ousterState_->lidarPkt.buf.data(), ousterState_->lidarPkt.buf.size());
 
       if (nRead > 0)
       {
-        if (batcher(ousterState_->lidarBuf.data(), scan))
+        if (batcher(ousterState_->lidarPkt, scan))
         {
           auto obs = scanToObservation(scan);
           if (obs && obs->pointcloud && obs->pointcloud->size() > 0)
@@ -757,15 +780,15 @@ void OusterDirectInput::pcapSpinOnce()
         }
       }
     }
-    else if (dstPort == imuPort && payloadSize <= ousterState_->imuBuf.size())
+    else if (dstPort == imuPort && payloadSize <= ousterState_->imuPkt.buf.size())
     {
       // Read IMU packet
-      const auto nRead = ouster::sensor_utils::read_packet(
-          handle, ousterState_->imuBuf.data(), ousterState_->imuBuf.size());
+      const auto nRead = spc::read_packet(
+          handle, ousterState_->imuPkt.buf.data(), ousterState_->imuPkt.buf.size());
 
       if (nRead > 0)
       {
-        auto obs = imuToObservation(ousterState_->imuBuf.data());
+        auto obs = imuToObservation(ousterState_->imuPkt.buf.data());
         if (obs)
         {
           sendObservationsToFrontEnds(obs);
@@ -779,8 +802,7 @@ void OusterDirectInput::pcapSpinOnce()
       {
         ousterState_->scratchBuf.resize(payloadSize + 1);
       }
-      ouster::sensor_utils::read_packet(
-          handle, ousterState_->scratchBuf.data(), ousterState_->scratchBuf.size());
+      spc::read_packet(handle, ousterState_->scratchBuf.data(), ousterState_->scratchBuf.size());
     }
   }
 }

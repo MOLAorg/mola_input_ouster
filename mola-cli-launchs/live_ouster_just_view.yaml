@@ -1,0 +1,66 @@
+# -----------------------------------------------------------------------------
+#                        SLAM system definition for MOLA
+# This file defines:
+# Direct input from a live Ouster LiDAR sensor (no ROS required),
+# and the MOLA Visualizer — no odometry or mapping.
+# Use this to verify sensor connectivity and inspect the raw point clouds.
+# -----------------------------------------------------------------------------
+# Usage:
+#   OUSTER_HOSTNAME=os-122xxxxxxxxx.local  mola-cli \
+#       -c $(mola-dir mola_input_ouster)/mola-cli-launchs/live_ouster_just_view.yaml
+#
+# Or via the convenience script:
+#   mola-lo-gui-ouster-live os-122xxxxxxxxx.local
+#
+# Optional environment variables:
+#   OUSTER_LIDAR_MODE        Scan resolution/rate (default: _1024x10)
+#   OUSTER_TIMESTAMP_MODE    Timestamp source    (default: TIME_FROM_PTP_1588)
+#   OUSTER_UDP_DEST          Override UDP destination IP
+#   OUSTER_LIDAR_PORT        Override lidar UDP port  (default: auto)
+#   OUSTER_IMU_PORT          Override IMU UDP port    (default: auto)
+#   MOLA_LIDAR_NAME          Sensor label             (default: lidar)
+#   SENSOR_POSE_{X,Y,Z,YAW,PITCH,ROLL}  Mounting pose on vehicle (default: 0)
+# -----------------------------------------------------------------------------
+
+modules:
+  # =====================
+  # Visualizer
+  # =====================
+  - name: viz
+    type: mola::MolaViz
+    enabled: ${MOLA_WITH_GUI|true}
+    verbosity_level: "${MOLA_VERBOSITY_MOLA_VIZ|INFO}"
+    params: ~ # none
+
+  # =====================
+  # Ouster Direct Input
+  # =====================
+  - name: ouster_input
+    type: mola::OusterDirectInput
+    execution_rate: 50  # Hz (only affects spinOnce diagnostics in live mode)
+    verbosity_level: "${MOLA_VERBOSITY_OUSTER|INFO}"
+
+    gui_preview_sensors:
+      - raw_sensor_label: "${MOLA_LIDAR_NAME|lidar}"
+        decimation: 1
+        enabled: ${MOLA_WITH_GUI|true}
+        win_pos: 5 5 800 600
+
+    params:
+      sensor_hostname: "${OUSTER_HOSTNAME}"
+      udp_dest: "${OUSTER_UDP_DEST|}"
+      lidar_port: ${OUSTER_LIDAR_PORT|0}
+      imu_port:   ${OUSTER_IMU_PORT|0}
+
+      # Resolution and spin rate — see README for all valid values.
+      lidar_mode:     "${OUSTER_LIDAR_MODE|_1024x10}"
+      timestamp_mode: "${OUSTER_TIMESTAMP_MODE|TIME_FROM_PTP_1588}"
+
+      lidar_sensor_label: "${MOLA_LIDAR_NAME|lidar}"
+      imu_sensor_label:   "${MOLA_IMU_NAME|imu}"
+
+      # Pose of the Ouster sensor housing on the vehicle frame.
+      # The factory-calibrated lidar↔sensor and imu↔sensor intrinsic
+      # transforms are read from the sensor metadata and composed
+      # automatically with this mounting pose.
+      sensor_mounting_pose: "${SENSOR_POSE_X|0} ${SENSOR_POSE_Y|0} ${SENSOR_POSE_Z|0} ${SENSOR_POSE_YAW|0} ${SENSOR_POSE_PITCH|0} ${SENSOR_POSE_ROLL|0}"

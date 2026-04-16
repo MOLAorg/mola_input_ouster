@@ -29,18 +29,18 @@
 #include <thread>
 #include <vector>
 
-// Forward declarations to isolate Ouster SDK headers from downstream:
-namespace ouster
+// Forward declarations to isolate Ouster SDK headers from downstream (SDK 0.16+):
+namespace ouster::sdk::core
 {
 class LidarScan;
+class SensorInfo;
+class PacketFormat;
+}  // namespace ouster::sdk::core
 
-namespace sensor
+namespace ouster::sdk::sensor
 {
-struct client;
-struct sensor_info;
-struct packet_format;
-}  // namespace sensor
-}  // namespace ouster
+class SensorPacketSource;
+}  // namespace ouster::sdk::sensor
 
 namespace mola
 {
@@ -202,7 +202,8 @@ class OusterDirectInput : public RawDataSourceBase
   void paceReplay(const mrpt::Clock::time_point& obsTimestamp);
 
   // ---- Conversions ----
-  mrpt::obs::CObservationPointCloud::Ptr scanToObservation(const ouster::LidarScan& scan);
+  mrpt::obs::CObservationPointCloud::Ptr scanToObservation(
+      const ouster::sdk::core::LidarScan& scan);
 
   mrpt::obs::CObservationIMU::Ptr imuToObservation(const uint8_t* buf);
 };

@@ -33,36 +33,67 @@ find_package(mrpt-obs REQUIRED)
 find_package(mrpt-maps REQUIRED)
 
 # ---------------------------------------------------------------------------
-# Find the Ouster SDK (ouster_client)
-# The Ouster SDK can be installed via:
-#   - System package manager
-#   - vcpkg
-#   - Building from source with `cmake --install`
-#   - As a subdirectory via add_subdirectory() or FetchContent
+# Find the Ouster SDK (ouster_client, ouster_pcap)
+#
+# Search order:
+#   1. A system-installed or user-installed OusterSDK (OusterSDK_DIR hint).
+#   2. The bundled git submodule at <source>/ouster-sdk (zero-install path).
+#
+# To force the bundled copy even when a system SDK is present, pass:
+#   -DUSE_BUNDLED_OUSTER_SDK=ON
 # ---------------------------------------------------------------------------
-find_package(OusterSDK REQUIRED COMPONENTS ouster_client ouster_pcap)
+option(USE_BUNDLED_OUSTER_SDK
+    "Always use the bundled ouster-sdk git submodule" OFF)
 
-# If OusterSDK config is not found, fall back to manual find:
-if(NOT TARGET OusterSDK::ouster_client)
-    # Try pkg-config or a manual find path
-    find_library(OUSTER_CLIENT_LIB NAMES ouster_client)
-    find_library(OUSTER_PCAP_LIB NAMES ouster_pcap)
-    find_path(OUSTER_CLIENT_INCLUDE_DIR NAMES ouster/client.h)
-    if(OUSTER_CLIENT_LIB AND OUSTER_PCAP_LIB AND OUSTER_CLIENT_INCLUDE_DIR)
-        add_library(OusterSDK::ouster_client UNKNOWN IMPORTED)
-        set_target_properties(OusterSDK::ouster_client PROPERTIES
-            IMPORTED_LOCATION "${OUSTER_CLIENT_LIB}"
-            INTERFACE_INCLUDE_DIRECTORIES "${OUSTER_CLIENT_INCLUDE_DIR}"
+set(_OUSTER_SDK_SUBMODULE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ouster-sdk")
+set(_OUSTER_SDK_SUBMODULE_PRESENT
+    EXISTS "${_OUSTER_SDK_SUBMODULE_DIR}/CMakeLists.txt")
+
+if(NOT USE_BUNDLED_OUSTER_SDK)
+    find_package(OusterSDK QUIET)
+endif()
+
+if(NOT OusterSDK_FOUND)
+    if(${_OUSTER_SDK_SUBMODULE_PRESENT})
+        message(STATUS
+            "OusterSDK not found on system — using bundled submodule: "
+            "${_OUSTER_SDK_SUBMODULE_DIR}")
+        # Mirror the options used by ouster-ros so only what we need is built
+        set(BUILD_VIZ     OFF CACHE BOOL "" FORCE)
+        set(BUILD_OSF     OFF CACHE BOOL "" FORCE)
+        set(BUILD_MAPPING OFF CACHE BOOL "" FORCE)
+        set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+        set(BUILD_TESTING  OFF CACHE BOOL "" FORCE)
+        set(BUILD_PCAP    ON  CACHE BOOL "" FORCE)
+        # Let FindOusterSDK.cmake (inside the submodule) drive add_subdirectory
+        list(APPEND CMAKE_MODULE_PATH "${_OUSTER_SDK_SUBMODULE_DIR}/cmake")
+        find_package(OusterSDK REQUIRED)
+
+        # Explicit include paths for the bundled submodule.
+        # ALIAS targets built in a subdirectory do not always propagate
+        # BUILD_INTERFACE include dirs to consumers in the parent scope,
+        # so we list them directly here.
+        set(_OUSTER_SDK_INCLUDE_DIRS
+            "${_OUSTER_SDK_SUBMODULE_DIR}/ouster_sensor/include"
+            "${_OUSTER_SDK_SUBMODULE_DIR}/ouster_client/include"
+            "${_OUSTER_SDK_SUBMODULE_DIR}/ouster_client/include/optional-lite"
+            "${_OUSTER_SDK_SUBMODULE_DIR}/ouster_pcap/include"
         )
-        add_library(OusterSDK::ouster_pcap UNKNOWN IMPORTED)
-        set_target_properties(OusterSDK::ouster_pcap PROPERTIES
-            IMPORTED_LOCATION "${OUSTER_PCAP_LIB}"
-            INTERFACE_INCLUDE_DIRECTORIES "${OUSTER_CLIENT_INCLUDE_DIR}"
-        )
+
+        # Workaround: some versions of libtins (system package) omit
+        # '#include <cstdint>' in ip_address.h, causing 'std::uint32_t'
+        # errors when building ouster_pcap against them.  Force-include
+        # the header for every TU that belongs to the ouster_pcap target.
+        if(TARGET ouster_pcap)
+            target_compile_options(ouster_pcap PRIVATE
+                $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-include;cstdint>)
+        endif()
     else()
         message(FATAL_ERROR
-            "OusterSDK not found. Please install the Ouster SDK or set "
-            "OusterSDK_DIR to its cmake config directory.\n"
+            "OusterSDK not found and the bundled submodule is missing.\n"
+            "Either install the Ouster SDK system-wide, set OusterSDK_DIR,\n"
+            "or initialise the submodule:\n"
+            "  git submodule update --init --recursive\n"
             "See: https://github.com/ouster-lidar/ouster-sdk")
     endif()
 endif()
@@ -80,6 +111,8 @@ target_include_directories(${PROJECT_NAME}
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
+    PRIVATE
+        ${_OUSTER_SDK_INCLUDE_DIRS}   # populated when using the bundled submodule
 )
 
 target_link_libraries(${PROJECT_NAME}
@@ -89,6 +122,9 @@ target_link_libraries(${PROJECT_NAME}
         mola::mola_yaml
         mrpt::obs
         mrpt::maps
+        # ouster_sensor was split out in SDK >= 0.16; present in the bundled submodule
+        $<TARGET_NAME_IF_EXISTS:OusterSDK::ouster_sensor>
+        $<TARGET_NAME_IF_EXISTS:OusterSDK::ouster_sensor>
         OusterSDK::ouster_client
         OusterSDK::ouster_pcap
 )

@@ -19,7 +19,47 @@ by `mola::LidarOdometry`, state estimators, or any other
 - [mola_kernel](https://github.com/MOLAorg/mola/tree/develop/mola_kernel)
 - [mola_yaml](https://github.com/MOLAorg/mola/tree/develop/mola_yaml)
 - [mrpt](https://github.com/MRPT/mrpt) (mrpt-obs, mrpt-maps)
-- [Ouster SDK](https://github.com/ouster-lidar/ouster-sdk) (ouster_client, ouster_pcap)
+- [Ouster SDK](https://github.com/ouster-lidar/ouster-sdk) (ouster_client, ouster_pcap) —
+  bundled as a git submodule (see below)
+
+### Ouster SDK: bundled submodule vs. system installation
+
+The Ouster SDK is included as a **git submodule** under `ouster-sdk/`, so the
+package is self-contained and requires no separate SDK installation.
+
+Clone with submodules:
+
+```bash
+git clone --recurse-submodules https://github.com/MOLAorg/mola_input_ouster.git
+```
+
+Or, if you already cloned without `--recurse-submodules`:
+
+```bash
+git submodule update --init --recursive
+```
+
+If a system-wide (or user-installed) Ouster SDK is already present on your
+machine, CMake will prefer it automatically. To force the bundled copy
+regardless, pass `-DUSE_BUNDLED_OUSTER_SDK=ON` to CMake.
+
+## Usage: Sensor check (just view, no SLAM)
+
+Quickly verify connectivity and inspect the raw point clouds without running
+any odometry:
+
+```bash
+OUSTER_HOSTNAME=os-122xxxxxxxxx.local \
+mola-cli -c $(mola-dir mola_input_ouster)/mola-cli-launchs/live_ouster_just_view.yaml
+```
+
+Same for a recorded PCAP file:
+
+```bash
+OUSTER_PCAP=/path/to/capture.pcap \
+OUSTER_META=/path/to/metadata.json \
+mola-cli -c $(mola-dir mola_input_ouster)/mola-cli-launchs/pcap_ouster_just_view.yaml
+```
 
 ## Usage: Live LiDAR odometry
 
@@ -39,6 +79,37 @@ For LiDAR-Inertial Odometry (LIO) with IMU deskewing:
 ```bash
 MOLA_DESKEW_METHOD=MotionCompensationMethod::IMU \
 mola-lo-gui-ouster-live os-122xxxxxxxxx.local
+```
+
+### Changing the lidar mode (resolution / spin rate)
+
+The `OUSTER_LIDAR_MODE` environment variable sets the scan resolution and
+rotation frequency. The format is `<columns>x<Hz>`:
+
+| Value | Columns | Hz | Notes |
+|---|---|---|---|
+| `_512x10` | 512 | 10 | Fastest — lowest horizontal resolution |
+| `_512x20` | 512 | 20 | |
+| `_1024x10` | 1024 | 10 | **Default** |
+| `_1024x20` | 1024 | 20 | Higher rate, same horizontal density |
+| `_2048x10` | 2048 | 10 | Highest horizontal resolution |
+| `_4096x5` | 4096 | 5 | Select sensors only |
+
+Example — run at 2048 columns × 10 Hz:
+
+```bash
+OUSTER_HOSTNAME=os-122xxxxxxxxx.local \
+OUSTER_LIDAR_MODE=_2048x10 \
+mola-lo-gui-ouster-live os-122xxxxxxxxx.local
+```
+
+Or directly via the YAML `params` block:
+
+```yaml
+params:
+  sensor_hostname: os-122xxxxxxxxx.local
+  lidar_mode: _1024x20
+  timestamp_mode: TIME_FROM_PTP_1588
 ```
 
 ## Usage: PCAP replay
@@ -140,10 +211,13 @@ following the same conventions as `mola_lidar_odometry`:
 
 ## Ouster SDK compatibility
 
-This module targets Ouster SDK ≥0.11.0 (the version where `init_client`
-uses `std::optional` for lidar/timestamp modes). Minor API adaptations
-may be needed for older or newer SDK versions. See the notes at the top
-of `OusterDirectInput.cpp`.
+The bundled submodule tracks Ouster SDK **v0.16.x** (currently pinned to
+`v0.16.1`). This is the same SDK version used by the official
+[ouster-ros](https://github.com/ouster-lidar/ouster-ros) driver.
+
+The module requires SDK ≥0.11.0 (the version where `init_client` uses
+`std::optional` for lidar/timestamp modes). See the notes at the top of
+`OusterDirectInput.cpp` for any API adaptation details.
 
 ## License
 
