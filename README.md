@@ -4,23 +4,32 @@ Provides a MOLA `RawDataSourceBase` module for
 [Ouster C++ SDK](https://github.com/ouster-lidar/ouster-sdk),
 **without requiring any ROS middleware**.
 
-This module can operate in two modes:
+This module can operate in three modes:
 
 - **Live sensor**: Connects to an Ouster sensor on the network.
 - **PCAP replay**: Replays a recorded `.pcap` capture file.
+- **OSF replay**: Replays an Ouster `.osf` recording (sensor metadata is
+  embedded in the file — no separate JSON required).
 
 It produces `mrpt::obs::CObservationPointCloud` and
 `mrpt::obs::CObservationIMU` observations for downstream consumption
 by `mola::LidarOdometry`, state estimators, or any other
 `mola::RawDataConsumer`.
 
+## Usage: OSF replay (just view, no SLAM)
+
+```bash
+OUSTER_OSF=/path/to/recording.osf \
+mola-cli -c $(mola-dir mola_input_ouster)/mola-cli-launchs/osf_ouster_just_view.yaml
+```
+
 ## Build dependencies
 
 - [mola_kernel](https://github.com/MOLAorg/mola/tree/develop/mola_kernel)
 - [mola_yaml](https://github.com/MOLAorg/mola/tree/develop/mola_yaml)
 - [mrpt](https://github.com/MRPT/mrpt) (mrpt-obs, mrpt-maps)
-- [Ouster SDK](https://github.com/ouster-lidar/ouster-sdk) (ouster_client, ouster_pcap) —
-  bundled as a git submodule (see below)
+- [Ouster SDK](https://github.com/ouster-lidar/ouster-sdk) (ouster_client, ouster_pcap,
+  ouster_osf) — bundled as a git submodule (see below)
 
 ### Ouster SDK: bundled submodule vs. system installation
 
@@ -136,8 +145,9 @@ The most important ones:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `sensor_hostname` | (required for live) | Ouster sensor hostname or IP |
-| `pcap_file` | (required for replay) | Path to `.pcap` capture file |
-| `metadata_json` | (required for replay) | Path to Ouster metadata JSON file |
+| `pcap_file` | (required for PCAP) | Path to `.pcap` capture file |
+| `metadata_json` | (required for PCAP) | Path to Ouster metadata JSON file |
+| `osf_file` | (required for OSF) | Path to `.osf` recording file |
 | `lidar_mode` | `MODE_1024x10` | Ouster resolution/rate (live only) |
 | `timestamp_mode` | `TIME_FROM_PTP_1588` | Ouster timestamp source (live only) |
 | `lidar_sensor_label` | `lidar` | Sensor label for LiDAR observations |
@@ -202,6 +212,7 @@ following the same conventions as `mola_lidar_odometry`:
 | `OUSTER_HOSTNAME` | (none) | Sensor hostname for live mode |
 | `OUSTER_PCAP` | (none) | PCAP file path for replay mode |
 | `OUSTER_META` | (none) | Metadata JSON file path |
+| `OUSTER_OSF` | (none) | OSF file path for OSF replay mode |
 | `OUSTER_LIDAR_MODE` | `MODE_1024x10` | LiDAR resolution/rate |
 | `OUSTER_TIMESTAMP_MODE` | `TIME_FROM_PTP_1588` | Timestamp source |
 | `MOLA_LIDAR_NAME` | `lidar` | Sensor label |

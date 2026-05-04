@@ -60,7 +60,7 @@ if(NOT OusterSDK_FOUND)
             "${_OUSTER_SDK_SUBMODULE_DIR}")
         # Mirror the options used by ouster-ros so only what we need is built
         set(BUILD_VIZ     OFF CACHE BOOL "" FORCE)
-        set(BUILD_OSF     OFF CACHE BOOL "" FORCE)
+        set(BUILD_OSF     ON  CACHE BOOL "" FORCE)
         set(BUILD_MAPPING OFF CACHE BOOL "" FORCE)
         set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
         set(BUILD_TESTING  OFF CACHE BOOL "" FORCE)
@@ -78,6 +78,7 @@ if(NOT OusterSDK_FOUND)
             "${_OUSTER_SDK_SUBMODULE_DIR}/ouster_client/include"
             "${_OUSTER_SDK_SUBMODULE_DIR}/ouster_client/include/optional-lite"
             "${_OUSTER_SDK_SUBMODULE_DIR}/ouster_pcap/include"
+            "${_OUSTER_SDK_SUBMODULE_DIR}/ouster_osf/include"
         )
 
         # Workaround: some versions of libtins (system package) omit
@@ -127,6 +128,7 @@ target_link_libraries(${PROJECT_NAME}
         $<TARGET_NAME_IF_EXISTS:OusterSDK::ouster_sensor>
         OusterSDK::ouster_client
         OusterSDK::ouster_pcap
+        OusterSDK::ouster_osf
 )
 
 # ---------------------------------------------------------------------------

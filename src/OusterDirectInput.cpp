@@ -25,7 +25,7 @@
 #include <mola_yaml/yaml_helpers.h>
 #include <mrpt/containers/yaml.h>
 #include <mrpt/core/initializer.h>
-#include <mrpt/maps/CSimplePointsMap.h>
+#include <mrpt/maps/CGenericPointsMap.h>
 #include <mrpt/math/CMatrixFixed.h>
 #include <mrpt/obs/CObservationIMU.h>
 #include <mrpt/obs/CObservationPointCloud.h>
@@ -36,14 +36,18 @@
 #include <ouster/client.h>
 #include <ouster/lidar_scan.h>
 #include <ouster/os_pcap.h>
+#include <ouster/osf/meta_lidar_sensor.h>
+#include <ouster/osf/reader.h>
+#include <ouster/osf/stream_lidar_scan.h>
 #include <ouster/sensor_packet_source.h>
 #include <ouster/types.h>
 #include <ouster/xyzlut.h>
 
 // Convenience aliases for the SDK 0.16 namespace structure
-namespace sc  = ouster::sdk::core;
-namespace ss  = ouster::sdk::sensor;
-namespace spc = ouster::sdk::pcap;
+namespace sc   = ouster::sdk::core;
+namespace ss   = ouster::sdk::sensor;
+namespace spc  = ouster::sdk::pcap;
+namespace sosf = ouster::sdk::osf;
 
 #include <Eigen/Core>
 #include <chrono>
@@ -167,6 +171,11 @@ struct OusterDirectInput::OusterState
 
   // Reusable scratch buffer for skipping unknown packets
   std::vector<uint8_t> scratchBuf;
+
+  // OSF replay state (null unless in OSF mode)
+  std::unique_ptr<sosf::Reader>                osfReader;
+  std::unique_ptr<sosf::MessagesStreamingIter> osfIter;
+  std::unique_ptr<sosf::MessagesStreamingIter> osfEnd;
 };
 
 // ============================================================================
@@ -242,6 +251,10 @@ void OusterDirectInput::initialize_rds(const Yaml& c)
   {
     params_.metadata_json = cfg["metadata_json"].as<std::string>();
   }
+  if (cfg.has("osf_file"))
+  {
+    params_.osf_file = cfg["osf_file"].as<std::string>();
+  }
   if (cfg.has("time_warp_scale"))
   {
     params_.time_warp_scale = cfg["time_warp_scale"].as<double>();
@@ -278,9 +291,15 @@ void OusterDirectInput::initialize_rds(const Yaml& c)
 
   // --- Validate ---
   ASSERTMSG_(
-      !params_.sensor_hostname.empty() || !params_.pcap_file.empty(),
-      "Either 'sensor_hostname' (live) or 'pcap_file' (replay) must be "
-      "provided.");
+      !params_.sensor_hostname.empty() || !params_.pcap_file.empty() || !params_.osf_file.empty(),
+      "One of 'sensor_hostname' (live), 'pcap_file' (PCAP replay), or "
+      "'osf_file' (OSF replay) must be provided.");
+
+  ASSERTMSG_(
+      (params_.sensor_hostname.empty() ? 0 : 1) + (params_.pcap_file.empty() ? 0 : 1) +
+              (params_.osf_file.empty() ? 0 : 1) <=
+          1,
+      "Only one of 'sensor_hostname', 'pcap_file', 'osf_file' may be set.");
 
   if (!params_.pcap_file.empty())
   {
@@ -294,12 +313,23 @@ void OusterDirectInput::initialize_rds(const Yaml& c)
         "metadata_json not found: '"s + params_.metadata_json + "'"s);
   }
 
+  if (!params_.osf_file.empty())
+  {
+    ASSERTMSG_(
+        mrpt::system::fileExists(params_.osf_file),
+        "osf_file not found: '"s + params_.osf_file + "'"s);
+  }
+
   // --- Create Ouster state ---
   ousterState_ = std::make_unique<OusterState>();
 
   if (isLiveMode())
   {
     initLiveMode();
+  }
+  else if (isOsfMode())
+  {
+    initOsfMode();
   }
   else
   {
@@ -397,6 +427,31 @@ void OusterDirectInput::initPcapMode()
   MRPT_LOG_INFO_FMT(
       "PCAP using lidar_port=%d, imu_port=%d", ousterState_->pcapLidarPort,
       ousterState_->pcapImuPort);
+}
+
+// ============================================================================
+// initOsfMode: Open an OSF file for replay
+// ============================================================================
+void OusterDirectInput::initOsfMode()
+{
+  MRPT_LOG_INFO_STREAM("Opening Ouster OSF: " << params_.osf_file);
+
+  ousterState_->osfReader = std::make_unique<sosf::Reader>(params_.osf_file);
+
+  // Extract SensorInfo from the OSF metadata store
+  auto lidarSensorMeta = ousterState_->osfReader->meta_store().get<sosf::LidarSensor>();
+  ASSERTMSG_(lidarSensorMeta, "OSF file contains no LidarSensor metadata entry.");
+
+  ousterState_->info = lidarSensorMeta->info();
+
+  MRPT_LOG_INFO_STREAM(
+      "Loaded OSF metadata. Product: " << ousterState_->info.prod_line
+                                       << "  SN: " << ousterState_->info.sn);
+
+  // Create the streaming range and store begin/end iterators
+  auto range            = ousterState_->osfReader->messages();
+  ousterState_->osfIter = std::make_unique<sosf::MessagesStreamingIter>(range.begin());
+  ousterState_->osfEnd  = std::make_unique<sosf::MessagesStreamingIter>(range.end());
 }
 
 // ============================================================================
@@ -523,32 +578,90 @@ mrpt::obs::CObservationPointCloud::Ptr OusterDirectInput::scanToObservation(
   // range is a 2D Eigen array of shape (H, W).
   auto range = scan.field<uint32_t>(sc::ChanField::RANGE);
 
-  // Build MRPT point cloud
-  auto pts = mrpt::maps::CSimplePointsMap::Create();
+  // Detect which optional fields are present in this scan
+  const bool hasSig  = scan.has_field(sc::ChanField::SIGNAL);
+  const bool hasRefl = scan.has_field(sc::ChanField::REFLECTIVITY);
+  const bool hasRGB  = scan.has_field(sc::ChanField::RGB);
+
+  // Helper: read a scalar pixel field as float regardless of its underlying
+  // integer type (UINT8 / UINT16 / UINT32).  Returns 0 for unknown types.
+  auto readPixelFloat = [](const sc::LidarScan& s, const std::string& name,
+                           Eigen::Index r, Eigen::Index c) -> float
+  {
+    const auto& f = s.field(name);
+    switch (f.tag())
+    {
+      case sc::ChanFieldType::UINT8:
+        return static_cast<float>(f.get<uint8_t>()[r * static_cast<Eigen::Index>(s.w) + c]);
+      case sc::ChanFieldType::UINT16:
+        return static_cast<float>(f.get<uint16_t>()[r * static_cast<Eigen::Index>(s.w) + c]);
+      case sc::ChanFieldType::UINT32:
+        return static_cast<float>(f.get<uint32_t>()[r * static_cast<Eigen::Index>(s.w) + c]);
+      default:
+        return 0.f;
+    }
+  };
+
+  // RGB raw bytes — only valid when hasRGB; layout [H, W, 3] row-major.
+  // pixel at flat index idx = row*W + col → bytes rgbRaw[idx*3 + {0,1,2}].
+  const uint8_t* rgbRaw = nullptr;
+  if (hasRGB)
+  {
+    rgbRaw = scan.field(sc::ChanField::RGB).get<uint8_t>();
+  }
+
+  // Build MRPT point cloud — use CGenericPointsMap for arbitrary extra fields
+  auto pts = mrpt::maps::CGenericPointsMap::Create();
   pts->reserve(totalPts);
+
+  if (hasSig)  pts->registerField_float(mrpt::maps::CPointsMap::POINT_FIELD_INTENSITY);
+  if (hasRefl) pts->registerField_float("reflectivity");
+  if (hasRGB)
+  {
+    pts->registerField_uint8(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Ru8);
+    pts->registerField_uint8(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Gu8);
+    pts->registerField_uint8(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Bu8);
+  }
+
+  const auto& timestamps = scan.timestamp();
 
   for (std::size_t col = 0; col < static_cast<std::size_t>(W); ++col)
   {
     for (std::size_t row = 0; row < static_cast<std::size_t>(H); ++row)
     {
-      if (range(static_cast<Eigen::Index>(row), static_cast<Eigen::Index>(col)) == 0)
-      {
-        continue;  // invalid point
-      }
+      const auto r   = static_cast<Eigen::Index>(row);
+      const auto c   = static_cast<Eigen::Index>(col);
+
+      if (range(r, c) == 0) continue;  // invalid point
 
       // cartesian() output is row-major (H, W):
       //   pixel at (row, col) -> flat index = row * W + col
       const auto idx = static_cast<Eigen::Index>(row * static_cast<std::size_t>(W) + col);
-      const auto x   = static_cast<float>(cloud(idx, 0));
-      const auto y   = static_cast<float>(cloud(idx, 1));
-      const auto z   = static_cast<float>(cloud(idx, 2));
-      pts->insertPointFast(x, y, z);
+      pts->insertPointFast(
+          static_cast<float>(cloud(idx, 0)),
+          static_cast<float>(cloud(idx, 1)),
+          static_cast<float>(cloud(idx, 2)));
+
+      if (hasSig)
+        pts->insertPointField_float(
+            mrpt::maps::CPointsMap::POINT_FIELD_INTENSITY,
+            readPixelFloat(scan, sc::ChanField::SIGNAL, r, c));
+      if (hasRefl)
+        pts->insertPointField_float(
+            "reflectivity",
+            readPixelFloat(scan, sc::ChanField::REFLECTIVITY, r, c));
+      if (hasRGB && rgbRaw)
+      {
+        const uint8_t* px = rgbRaw + static_cast<std::size_t>(idx) * 3;
+        pts->insertPointField_uint8(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Ru8, px[0]);
+        pts->insertPointField_uint8(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Gu8, px[1]);
+        pts->insertPointField_uint8(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Bu8, px[2]);
+      }
     }
   }
 
   // Determine scan timestamp from column timestamps.
   // Use the middle column's timestamp as the representative time.
-  const auto& timestamps = scan.timestamp();
   const auto  midCol     = static_cast<Eigen::Index>(W / 2);
   uint64_t    scanTsNsec = 0;
 
@@ -713,6 +826,10 @@ void OusterDirectInput::spinOnce()
       module_publish_diagnostics(diag);
     }
   }
+  else if (isOsfMode())
+  {
+    osfSpinOnce();
+  }
   else
   {
     // PCAP replay: drive from spinOnce()
@@ -803,6 +920,52 @@ void OusterDirectInput::pcapSpinOnce()
         ousterState_->scratchBuf.resize(payloadSize + 1);
       }
       spc::read_packet(handle, ousterState_->scratchBuf.data(), ousterState_->scratchBuf.size());
+    }
+  }
+}
+
+// ============================================================================
+// osfSpinOnce: Drive OSF replay at the configured pace
+//
+// Advances through the OSF message stream until one full LidarScan is
+// emitted, then paces according to time_warp_scale.
+// ============================================================================
+void OusterDirectInput::osfSpinOnce()
+{
+  if (!ousterState_ || !ousterState_->osfIter || !ousterState_->osfEnd)
+  {
+    return;
+  }
+
+  auto& it  = *(ousterState_->osfIter);
+  auto& end = *(ousterState_->osfEnd);
+
+  bool gotScan = false;
+  while (!gotScan && it != end && !requestedShutdown())
+  {
+    auto msg = *it;
+    ++it;
+
+    if (msg.is<sosf::LidarScanStream>())
+    {
+      auto scan = msg.decode_msg<sosf::LidarScanStream>();
+      if (scan)
+      {
+        auto obs = scanToObservation(*scan);
+        if (obs && obs->pointcloud && obs->pointcloud->size() > 0)
+        {
+          paceReplay(obs->timestamp);
+          sendObservationsToFrontEnds(obs);
+          gotScan = true;
+        }
+      }
+    }
+
+    if (it == end)
+    {
+      MRPT_LOG_INFO("End of OSF file reached.");
+      onDatasetPlaybackEnds();
+      return;
     }
   }
 }

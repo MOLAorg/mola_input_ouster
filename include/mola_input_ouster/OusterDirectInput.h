@@ -42,6 +42,12 @@ namespace ouster::sdk::sensor
 class SensorPacketSource;
 }  // namespace ouster::sdk::sensor
 
+namespace ouster::sdk::osf
+{
+class Reader;
+struct MessagesStreamingIter;
+}  // namespace ouster::sdk::osf
+
 namespace mola
 {
 /** RawDataSource from an Ouster LiDAR sensor using the native Ouster C++ SDK.
@@ -74,10 +80,15 @@ namespace mola
  *  ## PCAP replay mode
  *  Set `pcap_file` and `metadata_json` to replay a recorded capture.
  *
+ *  ## OSF replay mode
+ *  Set `osf_file` to replay an Ouster `.osf` recording. Sensor metadata and
+ *  scan geometry are read directly from the OSF file; no separate metadata JSON
+ *  is required.
+ *
  *  ## YAML parameters
  *  ```yaml
  *  params:
- *    # --- Live mode (exclusive with pcap_file) ---
+ *    # --- Live mode (exclusive with pcap_file / osf_file) ---
  *    sensor_hostname: "os-122xxxxxxxxx.local"
  *    udp_dest: ""                   # empty = auto-detect
  *    lidar_port: 0                  # 0 = auto
@@ -86,6 +97,10 @@ namespace mola
  *    # --- PCAP replay mode ---
  *    pcap_file: "/path/to/capture.pcap"
  *    metadata_json: "/path/to/metadata.json"
+ *    time_warp_scale: 1.0
+ *
+ *    # --- OSF replay mode ---
+ *    osf_file: "/path/to/recording.osf"
  *    time_warp_scale: 1.0
  *
  *    # --- Sensor configuration (live mode only) ---
@@ -150,7 +165,11 @@ class OusterDirectInput : public RawDataSourceBase
     // PCAP replay mode
     std::string pcap_file;
     std::string metadata_json;
-    double      time_warp_scale = 1.0;
+
+    // OSF replay mode
+    std::string osf_file;
+
+    double time_warp_scale = 1.0;
 
     // Sensor configuration (live)
     std::string lidar_mode     = "MODE_1024x10";
@@ -170,7 +189,8 @@ class OusterDirectInput : public RawDataSourceBase
   };
   Params params_;
 
-  bool isLiveMode() const { return params_.pcap_file.empty(); }
+  bool isLiveMode() const { return params_.pcap_file.empty() && params_.osf_file.empty(); }
+  bool isOsfMode() const { return !params_.osf_file.empty(); }
 
   // Resolved sensorPose for observations:
   //  - resolvedLidarPose_: base_link → lidar frame (os_sensor ∘ lidar_to_sensor)
@@ -188,6 +208,7 @@ class OusterDirectInput : public RawDataSourceBase
   // ---- Initialization per mode ----
   void initLiveMode();
   void initPcapMode();
+  void initOsfMode();
 
   // ---- Live receiver thread ----
   std::thread       receiverThread_;
@@ -199,6 +220,7 @@ class OusterDirectInput : public RawDataSourceBase
   double                                 pcapLastDatasetTime_ = 0;
 
   void pcapSpinOnce();
+  void osfSpinOnce();
   void paceReplay(const mrpt::Clock::time_point& obsTimestamp);
 
   // ---- Conversions ----
