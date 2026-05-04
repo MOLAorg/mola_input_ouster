@@ -18,6 +18,14 @@
 
   <buildtool_depend>cmake</buildtool_depend>
 
+  <depend>curl</depend>
+
+  <build_depend>libtins-dev</build_depend>
+  <build_depend>libzip-dev</build_depend>
+  <build_depend>libpng-dev</build_depend>
+  <build_depend>eigen</build_depend>
+  <build_depend>libflatbuffers-dev</build_depend> 
+  
   <depend>mola_kernel</depend>
   <depend>mola_yaml</depend>
   <depend>mrpt_libobs</depend>
