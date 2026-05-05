@@ -34,6 +34,7 @@
 // Ouster SDK (0.16+):
 #include <ouster/cartesian.h>
 #include <ouster/client.h>
+#include <ouster/image_processing.h>
 #include <ouster/lidar_scan.h>
 #include <ouster/os_pcap.h>
 #include <ouster/osf/meta_lidar_sensor.h>
@@ -176,6 +177,10 @@ struct OusterDirectInput::OusterState
   std::unique_ptr<sosf::Reader>                osfReader;
   std::unique_ptr<sosf::MessagesStreamingIter> osfIter;
   std::unique_ptr<sosf::MessagesStreamingIter> osfEnd;
+
+  // Stateful auto-exposure for float16 RGB fields (SDK v0.16.2+).
+  // Kept across scans so it converges on stable exposure over time.
+  sc::image::AutoExposure rgbAutoExposure;
 };
 
 // ============================================================================
@@ -360,8 +365,7 @@ void OusterDirectInput::initLiveMode()
   auto ld_mode = sc::lidar_mode_of_string(params_.lidar_mode);
   auto ts_mode = sc::timestamp_mode_of_string(params_.timestamp_mode);
 
-  ASSERTMSG_(
-      ld_mode.has_value(), "Invalid lidar_mode: '"s + params_.lidar_mode + "'"s);
+  ASSERTMSG_(ld_mode.has_value(), "Invalid lidar_mode: '"s + params_.lidar_mode + "'"s);
   ASSERTMSG_(
       ts_mode != sc::TimestampMode::UNSPECIFIED,
       "Invalid timestamp_mode: '"s + params_.timestamp_mode + "'"s);
@@ -481,7 +485,7 @@ void OusterDirectInput::setupOusterFromInfo()
 
   // Allocate typed packet objects; share the PacketFormat with each packet
   // so ScanBatcher can validate them (SDK 0.16 requirement).
-  const auto& pf = *(ousterState_->pf);
+  const auto& pf                = *(ousterState_->pf);
   ousterState_->lidarPkt        = sc::LidarPacket(pf.lidar_packet_size);
   ousterState_->imuPkt          = sc::ImuPacket(pf.imu_packet_size);
   ousterState_->lidarPkt.format = ousterState_->pf;
@@ -584,21 +588,28 @@ mrpt::obs::CObservationPointCloud::Ptr OusterDirectInput::scanToObservation(
   const bool hasRGB  = scan.has_field(sc::ChanField::RGB);
 
   // Convert a float16 bit pattern to float32.
-  auto f16_to_f32 = [](uint16_t h) -> float {
-    uint32_t s  = (h >> 15u) & 1u;
-    uint32_t e  = (h >> 10u) & 0x1fu;
-    uint32_t m  = h & 0x3ffu;
+  auto f16_to_f32 = [](uint16_t h) -> float
+  {
+    uint32_t s = (h >> 15u) & 1u;
+    uint32_t e = (h >> 10u) & 0x1fu;
+    uint32_t m = h & 0x3ffu;
     uint32_t bits;
-    if (e == 0)       bits = (s << 31u) | ((m == 0) ? 0u : ((113u << 23u) | (m << 13u)));
-    else if (e == 31u) bits = (s << 31u) | 0x7f800000u | (m << 13u);
-    else               bits = (s << 31u) | ((e + 112u) << 23u) | (m << 13u);
-    float f; std::memcpy(&f, &bits, sizeof(f)); return f;
+    if (e == 0)
+      bits = (s << 31u) | ((m == 0) ? 0u : ((113u << 23u) | (m << 13u)));
+    else if (e == 31u)
+      bits = (s << 31u) | 0x7f800000u | (m << 13u);
+    else
+      bits = (s << 31u) | ((e + 112u) << 23u) | (m << 13u);
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
   };
 
   // Helper: read a scalar pixel field as float regardless of its underlying
   // integer type (UINT8 / UINT16 / UINT32 / FLOAT16).  Returns 0 for unknown types.
-  auto readPixelFloat = [&f16_to_f32](const sc::LidarScan& s, const std::string& name,
-                           Eigen::Index r, Eigen::Index c) -> float
+  auto readPixelFloat = [&f16_to_f32](
+                            const sc::LidarScan& s, const std::string& name, Eigen::Index r,
+                            Eigen::Index c) -> float
   {
     const auto& f = s.field(name);
     switch (f.tag())
@@ -619,22 +630,34 @@ mrpt::obs::CObservationPointCloud::Ptr OusterDirectInput::scanToObservation(
   // RGB raw bytes — only valid when hasRGB; layout [H, W, 3] row-major.
   // pixel at flat index idx = row*W + col → bytes rgbRaw[idx*3 + {0,1,2}].
   // SDK v0.16.2 introduced FLOAT16 RGB for the new RNG19_RFL8_SIG16_NIR16_RGB16
-  // profiles; older profiles use UINT8 packed bytes.
-  const uint8_t*        rgbRaw = nullptr;
-  std::vector<uint8_t>  rgbBuf;
+  // profiles. Those values are raw HDR (linear, unbounded); we apply
+  // AutoExposure (percentile contrast-stretch → [0,1]) before scaling to uint8.
+  // Older profiles use UINT8 packed bytes.
+  const uint8_t*       rgbRaw = nullptr;
+  std::vector<uint8_t> rgbBuf;
   if (hasRGB)
   {
     const auto& rgbField = scan.field(sc::ChanField::RGB);
     if (rgbField.tag() == sc::ChanFieldType::FLOAT16)
     {
-      const auto* f16 = rgbField.get<sc::float16_t>();
-      const std::size_t nElems = static_cast<std::size_t>(H) * static_cast<std::size_t>(W) * 3;
-      rgbBuf.resize(nElems);
-      for (std::size_t i = 0; i < nElems; ++i)
-      {
-        const float v = f16_to_f32(f16[i].data);
-        rgbBuf[i] = static_cast<uint8_t>(std::clamp(v * 255.f, 0.f, 255.f));
-      }
+      // Build TensorMaps over the raw float16 field and a float scratch buffer.
+      const auto* f16ptr  = rgbField.get<sc::float16_t>();
+      const auto  nElems  = static_cast<Eigen::Index>(H) * static_cast<Eigen::Index>(W) * 3;
+      std::vector<float> floatBuf(static_cast<std::size_t>(nElems));
+
+      // TensorMap shapes: [H, W, 3] row-major (RowMajor Tensor).
+      using F16TensorMap = Eigen::TensorMap<const sc::rgb_img_t<sc::float16_t>>;
+      using F32TensorMap = Eigen::TensorMap<sc::rgb_img_t<float>>;
+      F16TensorMap inputMap(f16ptr, static_cast<Eigen::Index>(H),
+                                    static_cast<Eigen::Index>(W), 3);
+      F32TensorMap outputMap(floatBuf.data(), static_cast<Eigen::Index>(H),
+                                              static_cast<Eigen::Index>(W), 3);
+
+      ousterState_->rgbAutoExposure.update(inputMap, outputMap);
+
+      rgbBuf.resize(static_cast<std::size_t>(nElems));
+      for (std::size_t i = 0; i < static_cast<std::size_t>(nElems); ++i)
+        rgbBuf[i] = static_cast<uint8_t>(std::clamp(floatBuf[i] * 255.f, 0.f, 255.f));
       rgbRaw = rgbBuf.data();
     }
     else
@@ -647,7 +670,7 @@ mrpt::obs::CObservationPointCloud::Ptr OusterDirectInput::scanToObservation(
   auto pts = mrpt::maps::CGenericPointsMap::Create();
   pts->reserve(totalPts);
 
-  if (hasSig)  pts->registerField_float(mrpt::maps::CPointsMap::POINT_FIELD_INTENSITY);
+  if (hasSig) pts->registerField_float(mrpt::maps::CPointsMap::POINT_FIELD_INTENSITY);
   if (hasRefl) pts->registerField_float("reflectivity");
   if (hasRGB)
   {
@@ -662,8 +685,8 @@ mrpt::obs::CObservationPointCloud::Ptr OusterDirectInput::scanToObservation(
   {
     for (std::size_t row = 0; row < static_cast<std::size_t>(H); ++row)
     {
-      const auto r   = static_cast<Eigen::Index>(row);
-      const auto c   = static_cast<Eigen::Index>(col);
+      const auto r = static_cast<Eigen::Index>(row);
+      const auto c = static_cast<Eigen::Index>(col);
 
       if (range(r, c) == 0) continue;  // invalid point
 
@@ -671,8 +694,7 @@ mrpt::obs::CObservationPointCloud::Ptr OusterDirectInput::scanToObservation(
       //   pixel at (row, col) -> flat index = row * W + col
       const auto idx = static_cast<Eigen::Index>(row * static_cast<std::size_t>(W) + col);
       pts->insertPointFast(
-          static_cast<float>(cloud(idx, 0)),
-          static_cast<float>(cloud(idx, 1)),
+          static_cast<float>(cloud(idx, 0)), static_cast<float>(cloud(idx, 1)),
           static_cast<float>(cloud(idx, 2)));
 
       if (hasSig)
@@ -681,8 +703,7 @@ mrpt::obs::CObservationPointCloud::Ptr OusterDirectInput::scanToObservation(
             readPixelFloat(scan, sc::ChanField::SIGNAL, r, c));
       if (hasRefl)
         pts->insertPointField_float(
-            "reflectivity",
-            readPixelFloat(scan, sc::ChanField::REFLECTIVITY, r, c));
+            "reflectivity", readPixelFloat(scan, sc::ChanField::REFLECTIVITY, r, c));
       if (hasRGB && rgbRaw)
       {
         const uint8_t* px = rgbRaw + static_cast<std::size_t>(idx) * 3;
@@ -695,8 +716,8 @@ mrpt::obs::CObservationPointCloud::Ptr OusterDirectInput::scanToObservation(
 
   // Determine scan timestamp from column timestamps.
   // Use the middle column's timestamp as the representative time.
-  const auto  midCol     = static_cast<Eigen::Index>(W / 2);
-  uint64_t    scanTsNsec = 0;
+  const auto midCol     = static_cast<Eigen::Index>(W / 2);
+  uint64_t   scanTsNsec = 0;
 
   if (midCol < timestamps.size() && timestamps(midCol) != 0)
   {
@@ -987,13 +1008,12 @@ void OusterDirectInput::osfSpinOnce()
         // Emit IMU observations from embedded IMU fields (ACCEL32_GYRO32_NMEA
         // profile stores multiple IMU samples per LidarScan).
         if (scan->has_field(sc::ChanField::IMU_TIMESTAMP) &&
-            scan->has_field(sc::ChanField::IMU_ACC) &&
-            scan->has_field(sc::ChanField::IMU_GYRO))
+            scan->has_field(sc::ChanField::IMU_ACC) && scan->has_field(sc::ChanField::IMU_GYRO))
         {
-          constexpr double G_TO_MS2 = 9.80665;
-          const sc::ArrayView1<uint64_t>  imuTs  = scan->field(sc::ChanField::IMU_TIMESTAMP);
-          const sc::ArrayView2<float>     imuAcc = scan->field(sc::ChanField::IMU_ACC);
-          const sc::ArrayView2<float>     imuGyro = scan->field(sc::ChanField::IMU_GYRO);
+          constexpr double               G_TO_MS2 = 9.80665;
+          const sc::ArrayView1<uint64_t> imuTs    = scan->field(sc::ChanField::IMU_TIMESTAMP);
+          const sc::ArrayView2<float>    imuAcc   = scan->field(sc::ChanField::IMU_ACC);
+          const sc::ArrayView2<float>    imuGyro  = scan->field(sc::ChanField::IMU_GYRO);
 
           for (std::size_t i = 0; i < imuTs.shape[0]; ++i)
           {
