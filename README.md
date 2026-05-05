@@ -16,6 +16,15 @@ It produces `mrpt::obs::CObservationPointCloud` and
 by `mola::LidarOdometry`, state estimators, or any other
 `mola::RawDataConsumer`.
 
+
+| Distro | Build dev | Release |
+| --- | --- | --- |
+| ROS 2 Humble (u22.04) | [![Build Status](https://build.ros2.org/job/Hdev__mola_input_ouster__ubuntu_jammy_amd64/badge/icon)](https://build.ros2.org/job/Hdev__mola_input_ouster__ubuntu_jammy_amd64/) | [![Version](https://img.shields.io/ros/v/humble/mola_input_ouster)](https://index.ros.org/?search_packages=true&pkgs=mola_input_ouster) |
+| ROS 2 Jazzy (u24.04) | [![Build Status](https://build.ros2.org/job/Jdev__mola_input_ouster__ubuntu_noble_amd64/badge/icon)](https://build.ros2.org/job/Jdev__mola_input_ouster__ubuntu_noble_amd64/) | [![Version](https://img.shields.io/ros/v/jazzy/mola_input_ouster)](https://index.ros.org/?search_packages=true&pkgs=mola_input_ouster) |
+| ROS 2 Kilted (u24.04) | [![Build Status](https://build.ros2.org/job/Kdev__mola_input_ouster__ubuntu_noble_amd64/badge/icon)](https://build.ros2.org/job/Kdev__mola_input_ouster__ubuntu_noble_amd64/) | [![Version](https://img.shields.io/ros/v/kilted/mola_input_ouster)](https://index.ros.org/?search_packages=true&pkgs=mola_input_ouster) |
+| ROS 2 Rolling (u24.04) | [![Build Status](https://build.ros2.org/job/Rdev__mola_input_ouster__ubuntu_noble_amd64/badge/icon)](https://build.ros2.org/job/Rdev__mola_input_ouster__ubuntu_noble_amd64/) | [![Version](https://img.shields.io/ros/v/rolling/mola_input_ouster)](https://index.ros.org/?search_packages=true&pkgs=mola_input_ouster) |
+
+
 ## Usage: OSF replay (just view, no SLAM)
 
 ```bash
