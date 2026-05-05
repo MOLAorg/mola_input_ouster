@@ -678,15 +678,30 @@ mrpt::obs::CObservationPointCloud::Ptr OusterDirectInput::scanToObservation(
     pts->registerField_uint8(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Gu8);
     pts->registerField_uint8(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Bu8);
   }
+  pts->registerField_float("t");
 
   const auto& timestamps = scan.timestamp();
 
+  // Find the first non-zero column timestamp to use as the scan origin.
+  uint64_t firstTs = 0;
+  for (Eigen::Index c = 0; c < timestamps.size(); ++c)
+  {
+    if (timestamps(c) != 0)
+    {
+      firstTs = static_cast<uint64_t>(timestamps(c));
+      break;
+    }
+  }
+
   for (std::size_t col = 0; col < static_cast<std::size_t>(W); ++col)
   {
+    const auto     c      = static_cast<Eigen::Index>(col);
+    const uint64_t colTs  = static_cast<uint64_t>(timestamps(c));
+    const float    t_secs = (colTs >= firstTs) ? static_cast<float>((colTs - firstTs) * 1e-9) : 0.f;
+
     for (std::size_t row = 0; row < static_cast<std::size_t>(H); ++row)
     {
       const auto r = static_cast<Eigen::Index>(row);
-      const auto c = static_cast<Eigen::Index>(col);
 
       if (range(r, c) == 0) continue;  // invalid point
 
@@ -697,6 +712,7 @@ mrpt::obs::CObservationPointCloud::Ptr OusterDirectInput::scanToObservation(
           static_cast<float>(cloud(idx, 0)), static_cast<float>(cloud(idx, 1)),
           static_cast<float>(cloud(idx, 2)));
 
+      pts->insertPointField_float("t", t_secs);
       if (hasSig)
         pts->insertPointField_float(
             mrpt::maps::CPointsMap::POINT_FIELD_INTENSITY,
@@ -714,27 +730,8 @@ mrpt::obs::CObservationPointCloud::Ptr OusterDirectInput::scanToObservation(
     }
   }
 
-  // Determine scan timestamp from column timestamps.
-  // Use the middle column's timestamp as the representative time.
-  const auto midCol     = static_cast<Eigen::Index>(W / 2);
-  uint64_t   scanTsNsec = 0;
-
-  if (midCol < timestamps.size() && timestamps(midCol) != 0)
-  {
-    scanTsNsec = static_cast<uint64_t>(timestamps(midCol));
-  }
-  else
-  {
-    // Fallback: use first non-zero timestamp
-    for (Eigen::Index c = 0; c < timestamps.size(); ++c)
-    {
-      if (timestamps(c) != 0)
-      {
-        scanTsNsec = static_cast<uint64_t>(timestamps(c));
-        break;
-      }
-    }
-  }
+  // Scan-level timestamp: use the first column timestamp (same origin as "t" fields).
+  const uint64_t scanTsNsec = firstTs;
 
   auto obs         = mrpt::obs::CObservationPointCloud::Create();
   obs->pointcloud  = std::move(pts);
