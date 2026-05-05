@@ -751,9 +751,13 @@ mrpt::obs::CObservationPointCloud::Ptr OusterDirectInput::scanToObservation(
 // Accelerations and angular velocities are in the Ouster *IMU frame*.
 // sensorPose is set to resolvedImuPose_ = base_link → os_imu,
 // so downstream consumers know where the IMU frame sits on the vehicle.
-// Units are converted from the raw sensor format:
-//   acceleration:      g      → m/s²
-//   angular velocity:  deg/s  → rad/s
+//
+// Unit conversion depends on the IMU UDP profile:
+//   LEGACY profile:     imu_la_{x,y,z} in g      → multiply by 9.80665 → m/s²
+//                       imu_av_{x,y,z} in deg/s  → DEG2RAD              → rad/s
+//   Non-legacy profile: imu_la_{x,y,z} already in m/s²  (no conversion)
+//                       imu_av_{x,y,z} already in rad/s (no conversion)
+// This mirrors the logic in the Ouster SDK's ImuPacket::accel() / gyro().
 // ============================================================================
 mrpt::obs::CObservationIMU::Ptr OusterDirectInput::imuToObservation(const uint8_t* buf)
 {
@@ -761,23 +765,29 @@ mrpt::obs::CObservationIMU::Ptr OusterDirectInput::imuToObservation(const uint8_
 
   const auto& pf = *(ousterState_->pf);
 
-  // Extract IMU fields from packet buffer using the packet_format API.
-  //   imu_gyro_ts(buf)    -> uint64_t nanoseconds
-  //   imu_la_{x,y,z}(buf) -> float   (acceleration in g)
-  //   imu_av_{x,y,z}(buf) -> float   (angular velocity in deg/s)
-  //
-  // CObservationIMU expects m/s² and rad/s, so we convert here.
-  // Reference: Ouster Sensor Docs, "IMU Data Format" section.
-  constexpr double G_TO_MS2 = 9.80665;
-
   const uint64_t tsNsec = pf.imu_gyro_ts(buf);
 
-  const auto laX = static_cast<double>(pf.imu_la_x(buf)) * G_TO_MS2;
-  const auto laY = static_cast<double>(pf.imu_la_y(buf)) * G_TO_MS2;
-  const auto laZ = static_cast<double>(pf.imu_la_z(buf)) * G_TO_MS2;
-  const auto avX = mrpt::DEG2RAD(static_cast<double>(pf.imu_av_x(buf)));
-  const auto avY = mrpt::DEG2RAD(static_cast<double>(pf.imu_av_y(buf)));
-  const auto avZ = mrpt::DEG2RAD(static_cast<double>(pf.imu_av_z(buf)));
+  double laX, laY, laZ, avX, avY, avZ;
+  if (pf.udp_profile_imu == sc::UDPProfileIMU::LEGACY)
+  {
+    constexpr double G_TO_MS2 = 9.80665;
+    laX                       = static_cast<double>(pf.imu_la_x(buf)) * G_TO_MS2;
+    laY                       = static_cast<double>(pf.imu_la_y(buf)) * G_TO_MS2;
+    laZ                       = static_cast<double>(pf.imu_la_z(buf)) * G_TO_MS2;
+    avX                       = mrpt::DEG2RAD(static_cast<double>(pf.imu_av_x(buf)));
+    avY                       = mrpt::DEG2RAD(static_cast<double>(pf.imu_av_y(buf)));
+    avZ                       = mrpt::DEG2RAD(static_cast<double>(pf.imu_av_z(buf)));
+  }
+  else
+  {
+    // Non-legacy profiles already report m/s² and rad/s
+    laX = static_cast<double>(pf.imu_la_x(buf));
+    laY = static_cast<double>(pf.imu_la_y(buf));
+    laZ = static_cast<double>(pf.imu_la_z(buf));
+    avX = static_cast<double>(pf.imu_av_x(buf));
+    avY = static_cast<double>(pf.imu_av_y(buf));
+    avZ = static_cast<double>(pf.imu_av_z(buf));
+  }
 
   auto obs         = mrpt::obs::CObservationIMU::Create();
   obs->sensorLabel = params_.imu_sensor_label;
@@ -1007,13 +1017,13 @@ void OusterDirectInput::osfSpinOnce()
       {
         // Emit IMU observations from embedded IMU fields (ACCEL32_GYRO32_NMEA
         // profile stores multiple IMU samples per LidarScan).
+        // IMU_ACC is in m/s² and IMU_GYRO is in rad/s (non-legacy profile).
         if (scan->has_field(sc::ChanField::IMU_TIMESTAMP) &&
             scan->has_field(sc::ChanField::IMU_ACC) && scan->has_field(sc::ChanField::IMU_GYRO))
         {
-          constexpr double               G_TO_MS2 = 9.80665;
-          const sc::ArrayView1<uint64_t> imuTs    = scan->field(sc::ChanField::IMU_TIMESTAMP);
-          const sc::ArrayView2<float>    imuAcc   = scan->field(sc::ChanField::IMU_ACC);
-          const sc::ArrayView2<float>    imuGyro  = scan->field(sc::ChanField::IMU_GYRO);
+          const sc::ArrayView1<uint64_t> imuTs   = scan->field(sc::ChanField::IMU_TIMESTAMP);
+          const sc::ArrayView2<float>    imuAcc  = scan->field(sc::ChanField::IMU_ACC);
+          const sc::ArrayView2<float>    imuGyro = scan->field(sc::ChanField::IMU_GYRO);
 
           for (std::size_t i = 0; i < imuTs.shape[0]; ++i)
           {
@@ -1022,12 +1032,12 @@ void OusterDirectInput::osfSpinOnce()
             imuObs->sensorPose  = resolvedImuPose_;
             imuObs->timestamp   = ousterTsToMrpt(imuTs(i));
 
-            imuObs->set(mrpt::obs::IMU_X_ACC, static_cast<double>(imuAcc(i, 0)) * G_TO_MS2);
-            imuObs->set(mrpt::obs::IMU_Y_ACC, static_cast<double>(imuAcc(i, 1)) * G_TO_MS2);
-            imuObs->set(mrpt::obs::IMU_Z_ACC, static_cast<double>(imuAcc(i, 2)) * G_TO_MS2);
-            imuObs->set(mrpt::obs::IMU_WX, mrpt::DEG2RAD(static_cast<double>(imuGyro(i, 0))));
-            imuObs->set(mrpt::obs::IMU_WY, mrpt::DEG2RAD(static_cast<double>(imuGyro(i, 1))));
-            imuObs->set(mrpt::obs::IMU_WZ, mrpt::DEG2RAD(static_cast<double>(imuGyro(i, 2))));
+            imuObs->set(mrpt::obs::IMU_X_ACC, static_cast<double>(imuAcc(i, 0)));
+            imuObs->set(mrpt::obs::IMU_Y_ACC, static_cast<double>(imuAcc(i, 1)));
+            imuObs->set(mrpt::obs::IMU_Z_ACC, static_cast<double>(imuAcc(i, 2)));
+            imuObs->set(mrpt::obs::IMU_WX, static_cast<double>(imuGyro(i, 0)));
+            imuObs->set(mrpt::obs::IMU_WY, static_cast<double>(imuGyro(i, 1)));
+            imuObs->set(mrpt::obs::IMU_WZ, static_cast<double>(imuGyro(i, 2)));
 
             sendObservationsToFrontEnds(imuObs);
           }
