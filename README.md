@@ -20,7 +20,7 @@ by `mola::LidarOdometry`, state estimators, or any other
 
 ```bash
 OUSTER_OSF=/path/to/recording.osf \
-mola-cli -c $(mola-dir mola_input_ouster)/mola-cli-launchs/osf_ouster_just_view.yaml
+mola-cli  $(mola-dir mola_input_ouster)/mola-cli-launchs/osf_ouster_just_view.yaml
 ```
 
 ## Build dependencies
@@ -59,7 +59,7 @@ any odometry:
 
 ```bash
 OUSTER_HOSTNAME=os-122xxxxxxxxx.local \
-mola-cli -c $(mola-dir mola_input_ouster)/mola-cli-launchs/live_ouster_just_view.yaml
+mola-cli  $(mola-dir mola_input_ouster)/mola-cli-launchs/live_ouster_just_view.yaml
 ```
 
 Same for a recorded PCAP file:
@@ -67,14 +67,14 @@ Same for a recorded PCAP file:
 ```bash
 OUSTER_PCAP=/path/to/capture.pcap \
 OUSTER_META=/path/to/metadata.json \
-mola-cli -c $(mola-dir mola_input_ouster)/mola-cli-launchs/pcap_ouster_just_view.yaml
+mola-cli  $(mola-dir mola_input_ouster)/mola-cli-launchs/pcap_ouster_just_view.yaml
 ```
 
 ## Usage: Live LiDAR odometry
 
 ```bash
 OUSTER_HOSTNAME=os-122xxxxxxxxx.local \
-mola-cli -c $(mola-dir mola_input_ouster)/mola-cli-launchs/lidar_odometry_ouster_live.yaml
+mola-cli  $(mola-dir mola_input_ouster)/mola-cli-launchs/lidar_odometry_ouster_live.yaml
 ```
 
 Or using the convenience script:
@@ -126,7 +126,7 @@ params:
 ```bash
 OUSTER_PCAP=/path/to/capture.pcap \
 OUSTER_META=/path/to/metadata.json \
-mola-cli -c $(mola-dir mola_input_ouster)/mola-cli-launchs/lidar_odometry_ouster_pcap.yaml
+mola-cli  $(mola-dir mola_input_ouster)/mola-cli-launchs/lidar_odometry_ouster_pcap.yaml
 ```
 
 Or using the convenience script:

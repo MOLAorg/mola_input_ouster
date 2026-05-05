@@ -50,11 +50,14 @@ namespace spc  = ouster::sdk::pcap;
 namespace sosf = ouster::sdk::osf;
 
 #include <Eigen/Core>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <thread>
+#include <vector>
 
 using namespace mola;
 
@@ -361,7 +364,7 @@ void OusterDirectInput::initLiveMode()
   auto ts_mode = sc::timestamp_mode_of_string(params_.timestamp_mode);
 
   ASSERTMSG_(
-      ld_mode != sc::LidarMode::UNSPECIFIED, "Invalid lidar_mode: '"s + params_.lidar_mode + "'"s);
+      ld_mode.has_value(), "Invalid lidar_mode: '"s + params_.lidar_mode + "'"s);
   ASSERTMSG_(
       ts_mode != sc::TimestampMode::UNSPECIFIED,
       "Invalid timestamp_mode: '"s + params_.timestamp_mode + "'"s);
@@ -583,9 +586,21 @@ mrpt::obs::CObservationPointCloud::Ptr OusterDirectInput::scanToObservation(
   const bool hasRefl = scan.has_field(sc::ChanField::REFLECTIVITY);
   const bool hasRGB  = scan.has_field(sc::ChanField::RGB);
 
+  // Convert a float16 bit pattern to float32.
+  auto f16_to_f32 = [](uint16_t h) -> float {
+    uint32_t s  = (h >> 15u) & 1u;
+    uint32_t e  = (h >> 10u) & 0x1fu;
+    uint32_t m  = h & 0x3ffu;
+    uint32_t bits;
+    if (e == 0)       bits = (s << 31u) | ((m == 0) ? 0u : ((113u << 23u) | (m << 13u)));
+    else if (e == 31u) bits = (s << 31u) | 0x7f800000u | (m << 13u);
+    else               bits = (s << 31u) | ((e + 112u) << 23u) | (m << 13u);
+    float f; std::memcpy(&f, &bits, sizeof(f)); return f;
+  };
+
   // Helper: read a scalar pixel field as float regardless of its underlying
-  // integer type (UINT8 / UINT16 / UINT32).  Returns 0 for unknown types.
-  auto readPixelFloat = [](const sc::LidarScan& s, const std::string& name,
+  // integer type (UINT8 / UINT16 / UINT32 / FLOAT16).  Returns 0 for unknown types.
+  auto readPixelFloat = [&f16_to_f32](const sc::LidarScan& s, const std::string& name,
                            Eigen::Index r, Eigen::Index c) -> float
   {
     const auto& f = s.field(name);
@@ -597,6 +612,8 @@ mrpt::obs::CObservationPointCloud::Ptr OusterDirectInput::scanToObservation(
         return static_cast<float>(f.get<uint16_t>()[r * static_cast<Eigen::Index>(s.w) + c]);
       case sc::ChanFieldType::UINT32:
         return static_cast<float>(f.get<uint32_t>()[r * static_cast<Eigen::Index>(s.w) + c]);
+      case sc::ChanFieldType::FLOAT16:
+        return f16_to_f32(f.get<sc::float16_t>()[r * static_cast<Eigen::Index>(s.w) + c].data);
       default:
         return 0.f;
     }
@@ -604,10 +621,29 @@ mrpt::obs::CObservationPointCloud::Ptr OusterDirectInput::scanToObservation(
 
   // RGB raw bytes — only valid when hasRGB; layout [H, W, 3] row-major.
   // pixel at flat index idx = row*W + col → bytes rgbRaw[idx*3 + {0,1,2}].
-  const uint8_t* rgbRaw = nullptr;
+  // SDK v0.16.2 introduced FLOAT16 RGB for the new RNG19_RFL8_SIG16_NIR16_RGB16
+  // profiles; older profiles use UINT8 packed bytes.
+  const uint8_t*        rgbRaw = nullptr;
+  std::vector<uint8_t>  rgbBuf;
   if (hasRGB)
   {
-    rgbRaw = scan.field(sc::ChanField::RGB).get<uint8_t>();
+    const auto& rgbField = scan.field(sc::ChanField::RGB);
+    if (rgbField.tag() == sc::ChanFieldType::FLOAT16)
+    {
+      const auto* f16 = rgbField.get<sc::float16_t>();
+      const std::size_t nElems = static_cast<std::size_t>(H) * static_cast<std::size_t>(W) * 3;
+      rgbBuf.resize(nElems);
+      for (std::size_t i = 0; i < nElems; ++i)
+      {
+        const float v = f16_to_f32(f16[i].data);
+        rgbBuf[i] = static_cast<uint8_t>(std::clamp(v * 255.f, 0.f, 255.f));
+      }
+      rgbRaw = rgbBuf.data();
+    }
+    else
+    {
+      rgbRaw = rgbField.get<uint8_t>();
+    }
   }
 
   // Build MRPT point cloud — use CGenericPointsMap for arbitrary extra fields
