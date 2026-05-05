@@ -31,8 +31,9 @@ modules:
   # =====================
   - name: ouster_input
     type: mola::OusterDirectInput
-    execution_rate: 50  # Hz — drives osfSpinOnce() in replay mode
+    execution_rate: 50  # Hz: drives osfSpinOnce() in replay mode
     verbosity_level: "${MOLA_VERBOSITY_OUSTER|INFO}"
+    export_to_rawlog: "${MOLA_EXPORT_TO_RAWLOG|}"
 
     gui_preview_sensors:
       - raw_sensor_label: "${MOLA_LIDAR_NAME|lidar}"
