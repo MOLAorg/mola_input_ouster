@@ -92,13 +92,10 @@ mrpt::poses::CPose3D parsePoseString(const std::string& s)
 
 mrpt::Clock::time_point ousterTsToMrpt(uint64_t nsec)
 {
-  // Ouster timestamps are nanoseconds since Unix epoch when using PTP,
-  // or nanoseconds since sensor boot for internal clock.
-  // Convert to mrpt::Clock (which wraps std::chrono::system_clock).
-  using namespace std::chrono;
-  const auto dur = nanoseconds(nsec);
-  const auto tp  = std::chrono::time_point<std::chrono::system_clock, nanoseconds>(dur);
-  return mrpt::Clock::time_point(duration_cast<mrpt::Clock::duration>(tp.time_since_epoch()));
+  // Ouster timestamps are nanoseconds since Unix epoch (PTP) or since sensor
+  // boot (internal clock). mrpt::Clock uses the Windows FILETIME epoch
+  // (1601-01-01, 100ns ticks); fromDouble() handles that offset correctly.
+  return mrpt::Clock::fromDouble(static_cast<double>(nsec) * 1e-9);
 }
 
 }  // namespace
@@ -987,6 +984,35 @@ void OusterDirectInput::osfSpinOnce()
       auto scan = msg.decode_msg<sosf::LidarScanStream>();
       if (scan)
       {
+        // Emit IMU observations from embedded IMU fields (ACCEL32_GYRO32_NMEA
+        // profile stores multiple IMU samples per LidarScan).
+        if (scan->has_field(sc::ChanField::IMU_TIMESTAMP) &&
+            scan->has_field(sc::ChanField::IMU_ACC) &&
+            scan->has_field(sc::ChanField::IMU_GYRO))
+        {
+          constexpr double G_TO_MS2 = 9.80665;
+          const sc::ArrayView1<uint64_t>  imuTs  = scan->field(sc::ChanField::IMU_TIMESTAMP);
+          const sc::ArrayView2<float>     imuAcc = scan->field(sc::ChanField::IMU_ACC);
+          const sc::ArrayView2<float>     imuGyro = scan->field(sc::ChanField::IMU_GYRO);
+
+          for (std::size_t i = 0; i < imuTs.shape[0]; ++i)
+          {
+            auto imuObs         = mrpt::obs::CObservationIMU::Create();
+            imuObs->sensorLabel = params_.imu_sensor_label;
+            imuObs->sensorPose  = resolvedImuPose_;
+            imuObs->timestamp   = ousterTsToMrpt(imuTs(i));
+
+            imuObs->set(mrpt::obs::IMU_X_ACC, static_cast<double>(imuAcc(i, 0)) * G_TO_MS2);
+            imuObs->set(mrpt::obs::IMU_Y_ACC, static_cast<double>(imuAcc(i, 1)) * G_TO_MS2);
+            imuObs->set(mrpt::obs::IMU_Z_ACC, static_cast<double>(imuAcc(i, 2)) * G_TO_MS2);
+            imuObs->set(mrpt::obs::IMU_WX, mrpt::DEG2RAD(static_cast<double>(imuGyro(i, 0))));
+            imuObs->set(mrpt::obs::IMU_WY, mrpt::DEG2RAD(static_cast<double>(imuGyro(i, 1))));
+            imuObs->set(mrpt::obs::IMU_WZ, mrpt::DEG2RAD(static_cast<double>(imuGyro(i, 2))));
+
+            sendObservationsToFrontEnds(imuObs);
+          }
+        }
+
         auto obs = scanToObservation(*scan);
         if (obs && obs->pointcloud && obs->pointcloud->size() > 0)
         {
