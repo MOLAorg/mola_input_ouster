@@ -25,6 +25,7 @@
   <build_depend>libpng-dev</build_depend>
   <build_depend>eigen</build_depend>
   <build_depend>libflatbuffers-dev</build_depend> 
+  <build_depend>libssl-dev</build_depend>
   
   <depend>mola_kernel</depend>
   <depend>mola_yaml</depend>
