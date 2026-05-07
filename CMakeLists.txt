@@ -9,8 +9,7 @@
 # See LICENSE for full license information.
 # ------------------------------------------------------------------------------
 
-# Minimum CMake version required
-cmake_minimum_required(VERSION 3.9)
+cmake_minimum_required(VERSION 3.22...3.31)  # Ubuntu 22.04+
 
 # Tell CMake we'll use C++ for checkLibraryExists, etc.
 if(NOT CMAKE_VERSION VERSION_LESS 3.0)
