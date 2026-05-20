@@ -3,7 +3,7 @@
   schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>mola_input_ouster</name>
-  <version>0.1.0</version>
+  <version>0.0.1</version>
   <description>
     MOLA input module for Ouster LiDAR sensors using the native Ouster C++ SDK.
     Provides direct sensor connection and PCAP replay without ROS middleware.
