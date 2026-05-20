@@ -232,7 +232,7 @@ following the same conventions as `mola_lidar_odometry`:
 ## Ouster SDK compatibility
 
 The bundled submodule tracks Ouster SDK **v0.16.x** (currently pinned to
-`v0.16.1`). This is the same SDK version used by the official
+`v0.16.2`). This is the same SDK version used by the official
 [ouster-ros](https://github.com/ouster-lidar/ouster-ros) driver.
 
 The module requires SDK ≥0.11.0 (the version where `init_client` uses
