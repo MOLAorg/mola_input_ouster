@@ -28,8 +28,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # ---------------------------------------------------------------------------
 find_package(mola_kernel REQUIRED)
 find_package(mola_yaml REQUIRED)
-find_package(mrpt-obs REQUIRED)
-find_package(mrpt-maps REQUIRED)
+find_package(mrpt_obs REQUIRED)
+find_package(mrpt_maps REQUIRED)
 
 # ---------------------------------------------------------------------------
 # Find the Ouster SDK (ouster_client, ouster_pcap)
@@ -120,8 +120,8 @@ target_link_libraries(${PROJECT_NAME}
         mola::mola_kernel
     PRIVATE
         mola::mola_yaml
-        mrpt::obs
-        mrpt::maps
+        mrpt::mrpt_obs
+        mrpt::mrpt_maps
         # ouster_sensor was split out in SDK >= 0.16; present in the bundled submodule
         $<TARGET_NAME_IF_EXISTS:OusterSDK::ouster_sensor>
         $<TARGET_NAME_IF_EXISTS:OusterSDK::ouster_sensor>
