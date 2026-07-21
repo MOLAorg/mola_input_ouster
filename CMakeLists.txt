@@ -49,7 +49,30 @@ set(_OUSTER_SDK_SUBMODULE_PRESENT
     EXISTS "${_OUSTER_SDK_SUBMODULE_DIR}/CMakeLists.txt")
 
 if(NOT USE_BUNDLED_OUSTER_SDK)
-    find_package(OusterSDK QUIET)
+    # Another package in the workspace (e.g. the official ouster-ros driver)
+    # may also export a CMake package named "OusterSDK". If that export is
+    # incomplete (missing its generated *Targets.cmake file), find_package()
+    # would abort the whole configure with a hard error instead of just
+    # reporting "not found". Check for that file first, and only attempt
+    # find_package() if the export actually looks usable.
+    unset(_OusterSDK_CONFIG_FILE CACHE)
+    find_file(_OusterSDK_CONFIG_FILE
+        NAMES OusterSDKConfig.cmake
+        PATH_SUFFIXES lib/cmake/OusterSDK share/OusterSDK/cmake share/cmake/OusterSDK
+    )
+    if(_OusterSDK_CONFIG_FILE)
+        get_filename_component(_OusterSDK_CONFIG_DIR
+            "${_OusterSDK_CONFIG_FILE}" DIRECTORY)
+        if(EXISTS "${_OusterSDK_CONFIG_DIR}/OusterSDKTargets.cmake")
+            find_package(OusterSDK QUIET)
+        else()
+            message(STATUS
+                "Ignoring incomplete OusterSDK export at "
+                "${_OusterSDK_CONFIG_FILE} (missing OusterSDKTargets.cmake, "
+                "likely from an unrelated package in this workspace) "
+                "- using bundled submodule instead.")
+        endif()
+    endif()
 endif()
 
 if(NOT OusterSDK_FOUND)
