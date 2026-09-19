@@ -7,7 +7,7 @@ target_link_libraries(test-ouster-direct-input
     PRIVATE
         ${PROJECT_NAME}
         mola::mola_kernel
-        mrpt::obs
+        mrpt::mrpt_obs
 )
 
 add_test(NAME test-ouster-direct-input COMMAND test-ouster-direct-input)
