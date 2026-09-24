@@ -46,6 +46,8 @@ modules:
       osf_file: "${OUSTER_OSF}"
 
       time_warp_scale: ${MOLA_TIME_WARP|1.0}
+      decimate_columns: ${OUSTER_DECIMATE_COLUMNS|1}
+      decimate_rows: ${OUSTER_DECIMATE_ROWS|1}
 
       lidar_sensor_label: "${MOLA_LIDAR_NAME|lidar}"
       imu_sensor_label:   "${MOLA_IMU_NAME|imu}"

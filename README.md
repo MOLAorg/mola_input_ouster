@@ -163,17 +163,24 @@ The most important ones:
 | `lidar_sensor_label` | `lidar` | Sensor label for LiDAR observations |
 | `imu_sensor_label` | `imu` | Sensor label for IMU observations |
 | `sensor_mounting_pose` | `0 0 0 0 0 0` | Pose of sensor housing on vehicle (`base_link` → `os_sensor`), `x y z yaw_deg pitch_deg roll_deg` |
-| `lidar_sensor_pose` | (auto) | Manual override: `base_link` → lidar frame (bypasses intrinsic composition) |
+| `lidar_sensor_pose` | (auto) | Manual override: `base_link` → frame of the point coordinates (`os_sensor` unless the LUT changes) |
 | `imu_sensor_pose` | (auto) | Manual override: `base_link` → IMU frame (bypasses intrinsic composition) |
-| `time_warp_scale` | `1.0` | Replay speed multiplier (PCAP only) |
+| `time_warp_scale` | `1.0` | Replay speed multiplier (PCAP/OSF) |
+| `decimate_columns` | `1` | Keep every N-th column of each scan (all modes) |
+| `decimate_rows` | `1` | Keep every N-th row (beam) of each scan (all modes) |
+
+High-resolution sensors (e.g. Rev8 in 4096-column modes) deliver far more
+points than LiDAR odometry needs; `decimate_columns` drops them before they
+are converted, which is where most of the per-scan cost goes. See
+`mola-lo-gui-ouster-rev8` in `mola_lidar_odometry` for measured defaults.
 
 ## Coordinate frames and `sensorPose`
 
 In MRPT/MOLA, `CObservation::sensorPose` is the SE(3) pose of the
 sensor's own coordinate frame w.r.t. the vehicle frame (`base_link`).
 **Point coordinates inside `CObservationPointCloud::pointcloud` are
-expressed in the lidar frame, and IMU readings in `CObservationIMU` are
-expressed in the IMU frame.** The `sensorPose` tells downstream consumers
+expressed in the sensor housing frame (`os_sensor`), and IMU readings in
+`CObservationIMU` are expressed in the IMU frame.** The `sensorPose` tells downstream consumers
 where each of those frames sits on the vehicle. This is consistent with
 how `mrpt::ros2bridge` and `mola::BridgeROS2` handle observations.
 
@@ -192,20 +199,20 @@ from the metadata JSON in PCAP replay mode):
 
 Both are available in the SDK's `sensor_info` struct.
 
-By default, this module **automatically composes** the user-provided
-`sensor_mounting_pose` (pose of the housing on the vehicle, i.e.
-`base_link` → `os_sensor`) with each factory intrinsic:
+The SDK's XYZ lookup table already applies `lidar_to_sensor_transform`,
+so points come out in `os_sensor`, as in ouster-ros' `/ouster/points`. The
+IMU intrinsic is composed with the user-provided `sensor_mounting_pose`
+(pose of the housing on the vehicle, i.e. `base_link` → `os_sensor`):
 
 ```
-lidar sensorPose = sensor_mounting_pose (+) lidar_to_sensor_transform
-                 = base_link → os_sensor → os_lidar
+lidar sensorPose = sensor_mounting_pose
+                 = base_link → os_sensor
 
 IMU   sensorPose = sensor_mounting_pose (+) imu_to_sensor_transform
                  = base_link → os_sensor → os_imu
 ```
 
 This matches the TF tree published by the official ouster-ros driver.
-Point data stays in the lidar frame; IMU data stays in the IMU frame.
 
 If `lidar_sensor_pose` or `imu_sensor_pose` are set explicitly in YAML,
 they **override** the automatic composition and are used directly as the
@@ -228,6 +235,8 @@ following the same conventions as `mola_lidar_odometry`:
 | `MOLA_LIDAR_NAME` | `lidar` | Sensor label |
 | `MOLA_IMU_NAME` | `imu` | IMU sensor label |
 | `MOLA_TIME_WARP` | `1.0` | Replay speed |
+| `OUSTER_DECIMATE_COLUMNS` | `1` | Keep every N-th column of each scan |
+| `OUSTER_DECIMATE_ROWS` | `1` | Keep every N-th row of each scan |
 | `SENSOR_POSE_{X,Y,Z,YAW,PITCH,ROLL}` | `0` | Sensor housing mounting extrinsics |
 
 ## Ouster SDK compatibility
