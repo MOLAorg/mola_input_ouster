@@ -64,13 +64,13 @@ namespace mola
  *  the lookup table). IMU readings are in the **IMU frame**.
  *
  *  Each observation's `sensorPose` is set to the full transform from
- *  `base_link` to the respective sensor frame, matching the convention
+ *  `base_link` to the frame its data is expressed in, matching the convention
  *  used by `mrpt::ros2bridge` and `mola::BridgeROS2`:
  *
- *    lidar sensorPose = sensor_mounting_pose (+) lidar_to_sensor_transform
+ *    lidar sensorPose = sensor_mounting_pose
  *    IMU   sensorPose = sensor_mounting_pose (+) imu_to_sensor_transform
  *
- *  Both intrinsic transforms are read automatically from the sensor
+ *  The IMU intrinsic transform is read automatically from the sensor
  *  firmware metadata (`sensor_info`). The user only needs to provide
  *  `sensor_mounting_pose` (pose of the Ouster housing on the vehicle).
  *
@@ -102,6 +102,10 @@ namespace mola
  *    # --- OSF replay mode ---
  *    osf_file: "/path/to/recording.osf"
  *    time_warp_scale: 1.0
+ *
+ *    # --- Scan decimation (all modes): keep every N-th column / row ---
+ *    decimate_columns: 1
+ *    decimate_rows: 1
  *
  *    # --- Sensor configuration (live mode only) ---
  *    lidar_mode: "MODE_1024x10"
@@ -171,6 +175,12 @@ class OusterDirectInput : public RawDataSourceBase
 
     double time_warp_scale = 1.0;
 
+    // Keep only every N-th column / row of each scan (1 = all). Meant for
+    // high-resolution sensors, whose full scans are more than LiDAR odometry
+    // needs and are costly to convert, transfer and render.
+    int decimate_columns = 1;
+    int decimate_rows    = 1;
+
     // Sensor configuration (live)
     std::string lidar_mode     = "MODE_1024x10";
     std::string timestamp_mode = "TIME_FROM_PTP_1588";
@@ -193,9 +203,8 @@ class OusterDirectInput : public RawDataSourceBase
   bool isOsfMode() const { return !params_.osf_file.empty(); }
 
   // Resolved sensorPose for observations:
-  //  - resolvedLidarPose_: base_link → lidar frame (os_sensor ∘ lidar_to_sensor)
-  //  - resolvedImuPose_:   base_link → IMU frame   (os_sensor ∘ imu_to_sensor)
-  // Points stay in the lidar frame, IMU data stays in the IMU frame.
+  //  - resolvedLidarPose_: base_link → os_sensor (the frame of the XYZ LUT output)
+  //  - resolvedImuPose_:   base_link → IMU frame (os_sensor ∘ imu_to_sensor)
   mrpt::poses::CPose3D resolvedLidarPose_;
   mrpt::poses::CPose3D resolvedImuPose_;
 

@@ -43,6 +43,10 @@ modules:
       lidar_mode: "${OUSTER_LIDAR_MODE|MODE_1024x10}"
       timestamp_mode: "${OUSTER_TIMESTAMP_MODE|TIME_FROM_PTP_1588}"
 
+      # Keep every N-th column / row of each scan (1 = all):
+      decimate_columns: ${OUSTER_DECIMATE_COLUMNS|1}
+      decimate_rows: ${OUSTER_DECIMATE_ROWS|1}
+
       lidar_sensor_label: "${MOLA_LIDAR_NAME|lidar}"
       imu_sensor_label: "${MOLA_IMU_NAME|imu}"
 

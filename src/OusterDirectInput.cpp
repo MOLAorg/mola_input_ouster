@@ -264,6 +264,14 @@ void OusterDirectInput::initialize_rds(const Yaml& c)
   {
     params_.time_warp_scale = cfg["time_warp_scale"].as<double>();
   }
+  if (cfg.has("decimate_columns"))
+  {
+    params_.decimate_columns = cfg["decimate_columns"].as<int>();
+  }
+  if (cfg.has("decimate_rows"))
+  {
+    params_.decimate_rows = cfg["decimate_rows"].as<int>();
+  }
   if (cfg.has("lidar_mode"))
   {
     params_.lidar_mode = cfg["lidar_mode"].as<std::string>();
@@ -305,6 +313,10 @@ void OusterDirectInput::initialize_rds(const Yaml& c)
               (params_.osf_file.empty() ? 0 : 1) <=
           1,
       "Only one of 'sensor_hostname', 'pcap_file', 'osf_file' may be set.");
+
+  ASSERTMSG_(
+      params_.decimate_columns >= 1 && params_.decimate_rows >= 1,
+      "'decimate_columns' and 'decimate_rows' must be >= 1.");
 
   if (!params_.pcap_file.empty())
   {
@@ -495,11 +507,9 @@ void OusterDirectInput::setupOusterFromInfo()
   //
   // In MRPT/MOLA, CObservation::sensorPose is the SE(3) pose of the
   // sensor's own coordinate frame w.r.t. the vehicle frame (base_link).
-  // Point coordinates inside the observation are expressed in the
-  // sensor's own frame (lidar frame for point clouds, IMU frame for
-  // IMU readings). This is consistent with how mrpt::ros2bridge and
-  // BridgeROS2 work: they query /tf for base_link → sensor_frame_id
-  // and set that as sensorPose.
+  // Its data are expressed in that frame. This is consistent with how
+  // mrpt::ros2bridge and BridgeROS2 work: they query /tf for
+  // base_link → frame_id and set that as sensorPose.
   //
   // The Ouster sensor stores factory-calibrated 4×4 transforms (mm):
   //   lidar_to_sensor_transform: Lidar frame → Sensor housing frame
@@ -508,15 +518,10 @@ void OusterDirectInput::setupOusterFromInfo()
   // The user provides sensor_mounting_pose = pose of the sensor housing
   // on the vehicle (base_link → os_sensor).
   //
-  // We compose to get the full chain to each sensor's native frame:
-  //   resolved_lidar_pose = mounting ∘ lidar_to_sensor
-  //                       = base_link → os_sensor → os_lidar
+  //   resolved_lidar_pose = mounting = base_link → os_sensor
+  //     (the XYZ LUT already maps ranges into os_sensor, see scanToObservation)
   //   resolved_imu_pose   = mounting ∘ imu_to_sensor
   //                       = base_link → os_sensor → os_imu
-  //
-  // This matches the ouster-ros TF tree exactly. Points in
-  // CObservationPointCloud::pointcloud remain in the lidar frame;
-  // IMU readings in CObservationIMU remain in the IMU frame.
 
   if (params_.lidar_sensor_pose_override.has_value())
   {
@@ -526,13 +531,13 @@ void OusterDirectInput::setupOusterFromInfo()
   }
   else
   {
-    const auto lidarIntrinsic = mat4dToPose(info.lidar_to_sensor_transform);
-    resolvedLidarPose_        = params_.sensor_mounting_pose + lidarIntrinsic;
+    // The XYZ LUT already applies lidar_to_sensor_transform, so points are
+    // in os_sensor and must not be transformed by it again.
+    resolvedLidarPose_ = params_.sensor_mounting_pose;
     MRPT_LOG_INFO_STREAM(
-        "Lidar frame pose on vehicle (base_link -> os_lidar): "
-        << resolvedLidarPose_.asString()
-        << "\n  mounting (base_link->os_sensor): " << params_.sensor_mounting_pose.asString()
-        << "\n  intrinsic (os_sensor->os_lidar): " << lidarIntrinsic.asString());
+        "Lidar points frame pose on vehicle (base_link -> os_sensor): "
+        << resolvedLidarPose_.asString() << "\n  (os_sensor->os_lidar, applied by the LUT: "
+        << mat4dToPose(info.lidar_to_sensor_transform).asString() << ")");
   }
 
   if (params_.imu_sensor_pose_override.has_value())
@@ -555,83 +560,104 @@ void OusterDirectInput::setupOusterFromInfo()
 // ============================================================================
 // scanToObservation: Convert Ouster LidarScan -> CObservationPointCloud
 //
-// Point coordinates are in the Ouster *Sensor Coordinate Frame*
-// (make_xyz_lut(info) bakes lidar_to_sensor_transform into the LUT,
-// so cartesian() output is already in the sensor housing frame, which
-// is the standard frame used by ouster-ros for /ouster/points).
+// Point coordinates are in the Ouster *Sensor Coordinate Frame*: the LUT
+// from make_xyz_lut(info, false) bakes lidar_to_sensor_transform in, which is
+// the frame used by ouster-ros for /ouster/points. Hence, sensorPose is
+// resolvedLidarPose_ = base_link -> os_sensor.
 //
-// sensorPose is set to resolvedLidarPose_ = base_link → os_sensor,
-// (or the full chain base_link → os_sensor → os_lidar when intrinsic ≠ I).
-// This is consistent with how BridgeROS2 / mrpt::ros2bridge sets sensorPose.
+// Only every `decimate_columns`-th column and `decimate_rows`-th row are kept.
 // ============================================================================
+namespace
+{
+// Convert a float16 bit pattern to float32.
+float f16_to_f32(uint16_t h)
+{
+  const uint32_t s = (h >> 15u) & 1u;
+  const uint32_t e = (h >> 10u) & 0x1fu;
+  const uint32_t m = h & 0x3ffu;
+  uint32_t       bits;
+  if (e == 0)
+  {
+    bits = (s << 31u) | ((m == 0) ? 0u : ((113u << 23u) | (m << 13u)));
+  }
+  else if (e == 31u)
+  {
+    bits = (s << 31u) | 0x7f800000u | (m << 13u);
+  }
+  else
+  {
+    bits = (s << 31u) | ((e + 112u) << 23u) | (m << 13u);
+  }
+  float f;
+  std::memcpy(&f, &bits, sizeof(f));
+  return f;
+}
+
+// Read access to a scalar channel field (UINT8/16/32 or FLOAT16) as float,
+// resolved once per scan: looking a field up by name per pixel dominated the
+// conversion cost.
+class ScalarFieldReader
+{
+ public:
+  ScalarFieldReader(const sc::LidarScan& scan, const std::string& name)
+  {
+    if (!scan.has_field(name))
+    {
+      return;
+    }
+    const auto& f = scan.field(name);
+    tag_          = f.tag();
+    data_         = f.get();
+  }
+
+  bool valid() const { return data_ != nullptr; }
+
+  float operator[](std::size_t idx) const
+  {
+    switch (tag_)
+    {
+      case sc::ChanFieldType::UINT8:
+        return static_cast<float>(static_cast<const uint8_t*>(data_)[idx]);
+      case sc::ChanFieldType::UINT16:
+        return static_cast<float>(static_cast<const uint16_t*>(data_)[idx]);
+      case sc::ChanFieldType::UINT32:
+        return static_cast<float>(static_cast<const uint32_t*>(data_)[idx]);
+      case sc::ChanFieldType::FLOAT16:
+        return f16_to_f32(static_cast<const sc::float16_t*>(data_)[idx].data);
+      default:
+        return 0.f;
+    }
+  }
+
+ private:
+  const void*       data_ = nullptr;
+  sc::ChanFieldType tag_  = sc::ChanFieldType::VOID;
+};
+}  // namespace
+
 mrpt::obs::CObservationPointCloud::Ptr OusterDirectInput::scanToObservation(
     const sc::LidarScan& scan)
 {
   const ProfilerEntry tleg(profiler_, "scanToObservation");
 
-  const int  W        = ousterState_->w;
-  const int  H        = ousterState_->h;
-  const auto totalPts = static_cast<std::size_t>(W) * static_cast<std::size_t>(H);
+  const auto W  = static_cast<std::size_t>(ousterState_->w);
+  const auto H  = static_cast<std::size_t>(ousterState_->h);
+  const auto dc = static_cast<std::size_t>(params_.decimate_columns);
+  const auto dr = static_cast<std::size_t>(params_.decimate_rows);
 
-  // Convert range data to XYZ using the precomputed lookup table.
-  // cartesianT() returns an Eigen::Array<double, -1, 3> of shape (W*H, 3).
-  auto cloud =
-      sc::cartesianT<double>(scan, ousterState_->xyzLut.direction, ousterState_->xyzLut.offset);
+  // Range image, row-major (H, W): pixel (row, col) -> flat index row * W + col.
+  // The same flat index addresses the LUT rows and every other channel field.
+  const auto&     rangeImg = scan.field<uint32_t>(sc::ChanField::RANGE);
+  const uint32_t* range    = rangeImg.data();
 
-  // Get the range field to filter out invalid (zero-range) points.
-  // range is a 2D Eigen array of shape (H, W).
-  auto range = scan.field<uint32_t>(sc::ChanField::RANGE);
+  const ScalarFieldReader signal(scan, sc::ChanField::SIGNAL);
+  const ScalarFieldReader reflectivity(scan, sc::ChanField::REFLECTIVITY);
+  const bool              hasRGB = scan.has_field(sc::ChanField::RGB);
 
-  // Detect which optional fields are present in this scan
-  const bool hasSig  = scan.has_field(sc::ChanField::SIGNAL);
-  const bool hasRefl = scan.has_field(sc::ChanField::REFLECTIVITY);
-  const bool hasRGB  = scan.has_field(sc::ChanField::RGB);
-
-  // Convert a float16 bit pattern to float32.
-  auto f16_to_f32 = [](uint16_t h) -> float
-  {
-    uint32_t s = (h >> 15u) & 1u;
-    uint32_t e = (h >> 10u) & 0x1fu;
-    uint32_t m = h & 0x3ffu;
-    uint32_t bits;
-    if (e == 0)
-      bits = (s << 31u) | ((m == 0) ? 0u : ((113u << 23u) | (m << 13u)));
-    else if (e == 31u)
-      bits = (s << 31u) | 0x7f800000u | (m << 13u);
-    else
-      bits = (s << 31u) | ((e + 112u) << 23u) | (m << 13u);
-    float f;
-    std::memcpy(&f, &bits, sizeof(f));
-    return f;
-  };
-
-  // Helper: read a scalar pixel field as float regardless of its underlying
-  // integer type (UINT8 / UINT16 / UINT32 / FLOAT16).  Returns 0 for unknown types.
-  auto readPixelFloat = [&f16_to_f32](
-                            const sc::LidarScan& s, const std::string& name, Eigen::Index r,
-                            Eigen::Index c) -> float
-  {
-    const auto& f = s.field(name);
-    switch (f.tag())
-    {
-      case sc::ChanFieldType::UINT8:
-        return static_cast<float>(f.get<uint8_t>()[r * static_cast<Eigen::Index>(s.w) + c]);
-      case sc::ChanFieldType::UINT16:
-        return static_cast<float>(f.get<uint16_t>()[r * static_cast<Eigen::Index>(s.w) + c]);
-      case sc::ChanFieldType::UINT32:
-        return static_cast<float>(f.get<uint32_t>()[r * static_cast<Eigen::Index>(s.w) + c]);
-      case sc::ChanFieldType::FLOAT16:
-        return f16_to_f32(f.get<sc::float16_t>()[r * static_cast<Eigen::Index>(s.w) + c].data);
-      default:
-        return 0.f;
-    }
-  };
-
-  // RGB raw bytes — only valid when hasRGB; layout [H, W, 3] row-major.
-  // pixel at flat index idx = row*W + col → bytes rgbRaw[idx*3 + {0,1,2}].
+  // RGB raw bytes, only valid when hasRGB; layout [H, W, 3] row-major.
   // SDK v0.16.2 introduced FLOAT16 RGB for the new RNG19_RFL8_SIG16_NIR16_RGB16
   // profiles. Those values are raw HDR (linear, unbounded); we apply
-  // AutoExposure (percentile contrast-stretch → [0,1]) before scaling to uint8.
+  // AutoExposure (percentile contrast-stretch -> [0,1]) before scaling to uint8.
   // Older profiles use UINT8 packed bytes.
   const uint8_t*       rgbRaw = nullptr;
   std::vector<uint8_t> rgbBuf;
@@ -640,24 +666,25 @@ mrpt::obs::CObservationPointCloud::Ptr OusterDirectInput::scanToObservation(
     const auto& rgbField = scan.field(sc::ChanField::RGB);
     if (rgbField.tag() == sc::ChanFieldType::FLOAT16)
     {
-      // Build TensorMaps over the raw float16 field and a float scratch buffer.
-      const auto* f16ptr  = rgbField.get<sc::float16_t>();
-      const auto  nElems  = static_cast<Eigen::Index>(H) * static_cast<Eigen::Index>(W) * 3;
+      const auto*        f16ptr = rgbField.get<sc::float16_t>();
+      const auto         nElems = static_cast<Eigen::Index>(H * W * 3);
       std::vector<float> floatBuf(static_cast<std::size_t>(nElems));
 
       // TensorMap shapes: [H, W, 3] row-major (RowMajor Tensor).
       using F16TensorMap = Eigen::TensorMap<const sc::rgb_img_t<sc::float16_t>>;
       using F32TensorMap = Eigen::TensorMap<sc::rgb_img_t<float>>;
-      F16TensorMap inputMap(f16ptr, static_cast<Eigen::Index>(H),
-                                    static_cast<Eigen::Index>(W), 3);
-      F32TensorMap outputMap(floatBuf.data(), static_cast<Eigen::Index>(H),
-                                              static_cast<Eigen::Index>(W), 3);
+      const auto   eH    = static_cast<Eigen::Index>(H);
+      const auto   eW    = static_cast<Eigen::Index>(W);
+      F16TensorMap inputMap(f16ptr, eH, eW, 3);
+      F32TensorMap outputMap(floatBuf.data(), eH, eW, 3);
 
       ousterState_->rgbAutoExposure.update(inputMap, outputMap);
 
       rgbBuf.resize(static_cast<std::size_t>(nElems));
-      for (std::size_t i = 0; i < static_cast<std::size_t>(nElems); ++i)
+      for (std::size_t i = 0; i < rgbBuf.size(); ++i)
+      {
         rgbBuf[i] = static_cast<uint8_t>(std::clamp(floatBuf[i] * 255.f, 0.f, 255.f));
+      }
       rgbRaw = rgbBuf.data();
     }
     else
@@ -666,24 +693,9 @@ mrpt::obs::CObservationPointCloud::Ptr OusterDirectInput::scanToObservation(
     }
   }
 
-  // Build MRPT point cloud — use CGenericPointsMap for arbitrary extra fields
-  auto pts = mrpt::maps::CGenericPointsMap::Create();
-  pts->reserve(totalPts);
-
-  if (hasSig) pts->registerField_float(mrpt::maps::CPointsMap::POINT_FIELD_INTENSITY);
-  if (hasRefl) pts->registerField_float("reflectivity");
-  if (hasRGB)
-  {
-    pts->registerField_uint8(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Ru8);
-    pts->registerField_uint8(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Gu8);
-    pts->registerField_uint8(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Bu8);
-  }
-  pts->registerField_float("t");
-
+  // Per-column timestamps: find the first non-zero one to use as scan origin.
   const auto& timestamps = scan.timestamp();
-
-  // Find the first non-zero column timestamp to use as the scan origin.
-  uint64_t firstTs = 0;
+  uint64_t    firstTs    = 0;
   for (Eigen::Index c = 0; c < timestamps.size(); ++c)
   {
     if (timestamps(c) != 0)
@@ -693,51 +705,113 @@ mrpt::obs::CObservationPointCloud::Ptr OusterDirectInput::scanToObservation(
     }
   }
 
-  for (std::size_t col = 0; col < static_cast<std::size_t>(W); ++col)
+  // First pass: count valid (non-zero range) pixels, so the cloud and all
+  // its fields are allocated once and then filled through raw pointers.
+  std::size_t nPts = 0;
+  for (std::size_t row = 0; row < H; row += dr)
   {
-    const auto     c      = static_cast<Eigen::Index>(col);
-    const uint64_t colTs  = static_cast<uint64_t>(timestamps(c));
-    const float    t_secs = (colTs >= firstTs) ? static_cast<float>((colTs - firstTs) * 1e-9) : 0.f;
-
-    for (std::size_t row = 0; row < static_cast<std::size_t>(H); ++row)
+    for (std::size_t col = 0; col < W; col += dc)
     {
-      const auto r = static_cast<Eigen::Index>(row);
-
-      if (range(r, c) == 0) continue;  // invalid point
-
-      // cartesian() output is row-major (H, W):
-      //   pixel at (row, col) -> flat index = row * W + col
-      const auto idx = static_cast<Eigen::Index>(row * static_cast<std::size_t>(W) + col);
-      pts->insertPointFast(
-          static_cast<float>(cloud(idx, 0)), static_cast<float>(cloud(idx, 1)),
-          static_cast<float>(cloud(idx, 2)));
-
-      pts->insertPointField_float("t", t_secs);
-      if (hasSig)
-        pts->insertPointField_float(
-            mrpt::maps::CPointsMap::POINT_FIELD_INTENSITY,
-            readPixelFloat(scan, sc::ChanField::SIGNAL, r, c));
-      if (hasRefl)
-        pts->insertPointField_float(
-            "reflectivity", readPixelFloat(scan, sc::ChanField::REFLECTIVITY, r, c));
-      if (hasRGB && rgbRaw)
+      if (range[row * W + col] != 0)
       {
-        const uint8_t* px = rgbRaw + static_cast<std::size_t>(idx) * 3;
-        pts->insertPointField_uint8(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Ru8, px[0]);
-        pts->insertPointField_uint8(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Gu8, px[1]);
-        pts->insertPointField_uint8(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Bu8, px[2]);
+        nPts++;
       }
     }
   }
 
-  // Scan-level timestamp: use the first column timestamp (same origin as "t" fields).
-  const uint64_t scanTsNsec = firstTs;
+  auto pts = mrpt::maps::CGenericPointsMap::Create();
+
+  if (signal.valid())
+  {
+    pts->registerField_float(mrpt::maps::CPointsMap::POINT_FIELD_INTENSITY);
+  }
+  if (reflectivity.valid())
+  {
+    pts->registerField_float("reflectivity");
+  }
+  if (hasRGB)
+  {
+    pts->registerField_uint8(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Ru8);
+    pts->registerField_uint8(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Gu8);
+    pts->registerField_uint8(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Bu8);
+  }
+  pts->registerField_float("t");
+
+  pts->resize(nPts);
+
+  float* outT = pts->getPointsBufferRef_float_field("t")->data();
+  float* outI =
+      signal.valid()
+          ? pts->getPointsBufferRef_float_field(mrpt::maps::CPointsMap::POINT_FIELD_INTENSITY)
+                ->data()
+          : nullptr;
+  float* outRefl =
+      reflectivity.valid() ? pts->getPointsBufferRef_float_field("reflectivity")->data() : nullptr;
+  uint8_t* outR = nullptr;
+  uint8_t* outG = nullptr;
+  uint8_t* outB = nullptr;
+  if (rgbRaw)
+  {
+    outR =
+        pts->getPointsBufferRef_uint8_field(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Ru8)->data();
+    outG =
+        pts->getPointsBufferRef_uint8_field(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Gu8)->data();
+    outB =
+        pts->getPointsBufferRef_uint8_field(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Bu8)->data();
+  }
+
+  // XYZ = range * direction + offset, as in the SDK's cartesian():
+  const double* dir = ousterState_->xyzLut.direction.data();
+  const double* ofs = ousterState_->xyzLut.offset.data();
+
+  std::size_t i = 0;
+  for (std::size_t col = 0; col < W; col += dc)
+  {
+    const uint64_t colTs = static_cast<uint64_t>(timestamps(static_cast<Eigen::Index>(col)));
+    const float    tSecs = (colTs >= firstTs) ? static_cast<float>((colTs - firstTs) * 1e-9) : 0.f;
+
+    for (std::size_t row = 0; row < H; row += dr)
+    {
+      const std::size_t idx = row * W + col;
+      const auto        r   = static_cast<double>(range[idx]);
+      if (r == 0)
+      {
+        continue;  // invalid point
+      }
+
+      const std::size_t k = idx * 3;
+      pts->setPointFast(
+          i, static_cast<float>(r * dir[k + 0] + ofs[k + 0]),
+          static_cast<float>(r * dir[k + 1] + ofs[k + 1]),
+          static_cast<float>(r * dir[k + 2] + ofs[k + 2]));
+
+      outT[i] = tSecs;
+      if (outI)
+      {
+        outI[i] = signal[idx];
+      }
+      if (outRefl)
+      {
+        outRefl[i] = reflectivity[idx];
+      }
+      if (outR)
+      {
+        const uint8_t* px = rgbRaw + idx * 3;
+        outR[i]           = px[0];
+        outG[i]           = px[1];
+        outB[i]           = px[2];
+      }
+      i++;
+    }
+  }
+  pts->mark_as_modified();
 
   auto obs         = mrpt::obs::CObservationPointCloud::Create();
   obs->pointcloud  = std::move(pts);
   obs->sensorLabel = params_.lidar_sensor_label;
   obs->sensorPose  = resolvedLidarPose_;
-  obs->timestamp   = ousterTsToMrpt(scanTsNsec);
+  // Scan-level timestamp: the first column timestamp (same origin as "t" fields).
+  obs->timestamp = ousterTsToMrpt(firstTs);
 
   return obs;
 }
@@ -1024,6 +1098,10 @@ void OusterDirectInput::osfSpinOnce()
 
           for (std::size_t i = 0; i < imuTs.shape[0]; ++i)
           {
+            if (imuTs(i) == 0)
+            {
+              continue;  // slot not filled (e.g. a partial first scan)
+            }
             auto imuObs         = mrpt::obs::CObservationIMU::Create();
             imuObs->sensorLabel = params_.imu_sensor_label;
             imuObs->sensorPose  = resolvedImuPose_;
