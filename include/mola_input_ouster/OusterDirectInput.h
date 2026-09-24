@@ -116,10 +116,10 @@ namespace mola
  *    imu_sensor_label: "imu"
  *
  *    # --- Sensor housing pose on the vehicle (base_link → os_sensor) ---
- *    # The factory-calibrated lidar-to-sensor and imu-to-sensor
- *    # intrinsic transforms are read from the sensor metadata and
- *    # composed automatically:
- *    #   lidar sensorPose = mounting (+) lidar_to_sensor
+ *    # Points come out of the SDK already in os_sensor, so the lidar
+ *    # uses this pose directly. The factory-calibrated imu-to-sensor
+ *    # intrinsic is read from the sensor metadata and composed:
+ *    #   lidar sensorPose = mounting
  *    #   IMU   sensorPose = mounting (+) imu_to_sensor
  *    sensor_mounting_pose: "0 0 0 0 0 0"   # x y z yaw_deg pitch_deg roll_deg
  *

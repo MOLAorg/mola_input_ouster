@@ -536,7 +536,7 @@ void OusterDirectInput::setupOusterFromInfo()
     resolvedLidarPose_ = params_.sensor_mounting_pose;
     MRPT_LOG_INFO_STREAM(
         "Lidar points frame pose on vehicle (base_link -> os_sensor): "
-        << resolvedLidarPose_.asString() << "\n  (os_sensor->os_lidar, applied by the LUT: "
+        << resolvedLidarPose_.asString() << "\n  (os_lidar->os_sensor, applied by the LUT: "
         << mat4dToPose(info.lidar_to_sensor_transform).asString() << ")");
   }
 

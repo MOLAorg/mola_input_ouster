@@ -65,7 +65,7 @@ modules:
       imu_sensor_label:   "${MOLA_IMU_NAME|imu}"
 
       # Pose of the Ouster sensor housing on the vehicle frame.
-      # The factory-calibrated lidar↔sensor and imu↔sensor intrinsic
-      # transforms are read from the sensor metadata and composed
-      # automatically with this mounting pose.
+      # LiDAR points are already in the housing frame (os_sensor), so the
+      # LiDAR uses this pose directly; the factory-calibrated imu->sensor
+      # intrinsic is read from the sensor metadata and composed with it.
       sensor_mounting_pose: "${SENSOR_POSE_X|0} ${SENSOR_POSE_Y|0} ${SENSOR_POSE_Z|0} ${SENSOR_POSE_YAW|0} ${SENSOR_POSE_PITCH|0} ${SENSOR_POSE_ROLL|0}"
