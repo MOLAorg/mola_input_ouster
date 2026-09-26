@@ -166,6 +166,7 @@ The most important ones:
 | `lidar_sensor_pose` | (auto) | Manual override: `base_link` → frame of the point coordinates (`os_sensor` unless the LUT changes) |
 | `imu_sensor_pose` | (auto) | Manual override: `base_link` → IMU frame (bypasses intrinsic composition) |
 | `time_warp_scale` | `1.0` | Replay speed multiplier (PCAP/OSF) |
+| `start_paused` | `false` | Start the replay paused (PCAP/OSF) |
 | `decimate_columns` | `1` | Keep every N-th column of each scan (all modes) |
 | `decimate_rows` | `1` | Keep every N-th row (beam) of each scan (all modes) |
 
@@ -173,6 +174,16 @@ High-resolution sensors (e.g. Rev8 in 4096-column modes) deliver far more
 points than LiDAR odometry needs; `decimate_columns` drops them before they
 are converted, which is where most of the per-scan cost goes. See
 `mola-lo-gui-ouster-rev8` in `mola_lidar_odometry` for measured defaults.
+
+## Playback panel (PCAP / OSF)
+
+When replaying a PCAP or OSF file, the MOLA GUI shows the usual dataset
+playback panel: pause, replay speed, and a slider to jump to any scan, along
+with the current and total playback time. There is no such panel in live mode.
+
+OSF files are seekable as they are. PCAP files are first indexed in a
+background thread (a full pass over the file), so the replay starts right away
+and the panel shows up once indexing finishes.
 
 ## Coordinate frames and `sensorPose`
 
@@ -235,6 +246,7 @@ following the same conventions as `mola_lidar_odometry`:
 | `MOLA_LIDAR_NAME` | `lidar` | Sensor label |
 | `MOLA_IMU_NAME` | `imu` | IMU sensor label |
 | `MOLA_TIME_WARP` | `1.0` | Replay speed |
+| `MOLA_DATASET_START_PAUSED` | `false` | Start the replay paused |
 | `OUSTER_DECIMATE_COLUMNS` | `1` | Keep every N-th column of each scan |
 | `OUSTER_DECIMATE_ROWS` | `1` | Keep every N-th row of each scan |
 | `SENSOR_POSE_{X,Y,Z,YAW,PITCH,ROLL}` | `0` | Sensor housing mounting extrinsics |

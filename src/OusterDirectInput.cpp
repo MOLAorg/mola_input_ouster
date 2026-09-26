@@ -25,6 +25,7 @@
 #include <mola_yaml/yaml_helpers.h>
 #include <mrpt/containers/yaml.h>
 #include <mrpt/core/initializer.h>
+#include <mrpt/core/lock_helper.h>
 #include <mrpt/maps/CGenericPointsMap.h>
 #include <mrpt/math/CMatrixFixed.h>
 #include <mrpt/obs/CObservationIMU.h>
@@ -35,11 +36,13 @@
 #include <ouster/cartesian.h>
 #include <ouster/client.h>
 #include <ouster/image_processing.h>
+#include <ouster/indexed_pcap_reader.h>
 #include <ouster/lidar_scan.h>
-#include <ouster/os_pcap.h>
 #include <ouster/osf/meta_lidar_sensor.h>
+#include <ouster/osf/meta_streaming_info.h>
 #include <ouster/osf/reader.h>
 #include <ouster/osf/stream_lidar_scan.h>
+#include <ouster/pcap.h>
 #include <ouster/sensor_packet_source.h>
 #include <ouster/types.h>
 #include <ouster/xyzlut.h>
@@ -165,18 +168,21 @@ struct OusterDirectInput::OusterState
   int w = 0;  // columns per revolution
   int h = 0;  // pixels per column (channels)
 
-  // PCAP replay handle (null in live mode)
-  std::shared_ptr<spc::PlaybackHandle> pcapHandle;
-  int                                  pcapLidarPort = 0;
-  int                                  pcapImuPort   = 0;
-
-  // Reusable scratch buffer for skipping unknown packets
-  std::vector<uint8_t> scratchBuf;
+  // PCAP replay state (null unless in PCAP mode)
+  std::unique_ptr<spc::PcapReader> pcapReader;
+  int                              pcapLidarPort = 0;
+  int                              pcapImuPort   = 0;
+  uint64_t                         pcapStartUs   = 0;  // capture time of the first packet
+  std::optional<uint64_t>          pcapFrameStartUs;  // capture time of the scan being batched
 
   // OSF replay state (null unless in OSF mode)
   std::unique_ptr<sosf::Reader>                osfReader;
   std::unique_ptr<sosf::MessagesStreamingIter> osfIter;
   std::unique_ptr<sosf::MessagesStreamingIter> osfEnd;
+  uint32_t                                     osfStreamId  = 0;  // replayed LidarScan stream
+  uint64_t                                     osfScanCount = 0;
+  sosf::ts_t                                   osfStartTs{0};
+  sosf::ts_t                                   osfEndTs{0};
 
   // Stateful auto-exposure for float16 RGB fields (SDK v0.16.2+).
   // Kept across scans so it converges on stable exposure over time.
@@ -196,6 +202,11 @@ OusterDirectInput::~OusterDirectInput()
   {
     receiverThread_.join();
   }
+  pcapIndexAbort_ = true;
+  if (pcapIndexThread_.joinable())
+  {
+    pcapIndexThread_.join();
+  }
 }
 
 void OusterDirectInput::onQuit()
@@ -209,11 +220,10 @@ void OusterDirectInput::onQuit()
     receiverThread_.join();
   }
 
-  // Clean up PCAP handle
-  if (ousterState_ && ousterState_->pcapHandle)
+  pcapIndexAbort_ = true;
+  if (pcapIndexThread_.joinable())
   {
-    spc::replay_uninitialize(*(ousterState_->pcapHandle));
-    ousterState_->pcapHandle.reset();
+    pcapIndexThread_.join();
   }
 }
 
@@ -263,6 +273,10 @@ void OusterDirectInput::initialize_rds(const Yaml& c)
   if (cfg.has("time_warp_scale"))
   {
     params_.time_warp_scale = cfg["time_warp_scale"].as<double>();
+  }
+  if (cfg.has("start_paused"))
+  {
+    params_.start_paused = cfg["start_paused"].as<bool>();
   }
   if (cfg.has("decimate_columns"))
   {
@@ -355,11 +369,21 @@ void OusterDirectInput::initialize_rds(const Yaml& c)
 
   setupOusterFromInfo();
 
+  {
+    auto lck       = mrpt::lockHelper(dataset_ui_mtx_);
+    timeWarpScale_ = params_.time_warp_scale;
+    paused_        = params_.start_paused;
+  }
+
   // ---- Start receiver thread for live mode ----
   if (isLiveMode())
   {
     receiverRunning_ = true;
     receiverThread_  = std::thread(&OusterDirectInput::receiverThreadFunc, this);
+  }
+  else if (!isOsfMode())
+  {
+    pcapIndexThread_ = std::thread(&OusterDirectInput::pcapIndexThreadFunc, this);
   }
 
   MRPT_END
@@ -431,8 +455,15 @@ void OusterDirectInput::initPcapMode()
                                           << "  SN: " << ousterState_->info.sn);
 
   // Open pcap file for stepwise playback
-  ousterState_->pcapHandle = spc::replay_initialize(params_.pcap_file);
-  ASSERTMSG_(ousterState_->pcapHandle, "Failed to open PCAP file.");
+  ousterState_->pcapReader = std::make_unique<spc::PcapReader>(params_.pcap_file);
+
+  // The first packet capture time is the origin of the playback time:
+  if (ousterState_->pcapReader->next_packet() != 0)
+  {
+    ousterState_->pcapStartUs =
+        static_cast<uint64_t>(ousterState_->pcapReader->current_info().timestamp.count());
+  }
+  ousterState_->pcapReader->reset();
 
   // Determine the UDP ports used for LiDAR and IMU data.
   // These come from the sensor metadata (config section).
@@ -464,8 +495,43 @@ void OusterDirectInput::initOsfMode()
       "Loaded OSF metadata. Product: " << ousterState_->info.prod_line
                                        << "  SN: " << ousterState_->info.sn);
 
-  // Create the streaming range and store begin/end iterators
-  auto range            = ousterState_->osfReader->messages();
+  auto& reader = *(ousterState_->osfReader);
+
+  // Replay one LidarScan stream (the first one, if the file has several):
+  const auto scanStreams = reader.meta_store().find<sosf::LidarScanStreamMeta>();
+  ASSERTMSG_(!scanStreams.empty(), "OSF file contains no LidarScan stream.");
+  ousterState_->osfStreamId = scanStreams.begin()->first;
+  if (scanStreams.size() > 1)
+  {
+    MRPT_LOG_WARN_FMT(
+        "OSF file has %zu LidarScan streams, only the first one is replayed.", scanStreams.size());
+  }
+
+  // Number of scans and time span, for the playback UI:
+  ousterState_->osfStartTs = reader.start_ts();
+  ousterState_->osfEndTs   = reader.end_ts();
+  if (const auto streamingInfo = reader.meta_store().get<sosf::StreamingInfo>(); streamingInfo)
+  {
+    const auto& stats = streamingInfo->stream_stats();
+    if (const auto it = stats.find(ousterState_->osfStreamId); it != stats.end())
+    {
+      ousterState_->osfScanCount = it->second.message_count;
+      ousterState_->osfStartTs   = it->second.start_ts;
+      ousterState_->osfEndTs     = it->second.end_ts;
+    }
+  }
+  MRPT_LOG_INFO_FMT(
+      "OSF LidarScan stream: %lu scans, %.1f s.",
+      static_cast<unsigned long>(ousterState_->osfScanCount),
+      1e-9 * static_cast<double>((ousterState_->osfEndTs - ousterState_->osfStartTs).count()));
+
+  osfStartReadingAt(reader.start_ts());
+}
+
+void OusterDirectInput::osfStartReadingAt(const sosf::ts_t& startTs)
+{
+  auto& reader          = *(ousterState_->osfReader);
+  auto  range           = reader.messages({ousterState_->osfStreamId}, startTs, reader.end_ts());
   ousterState_->osfIter = std::make_unique<sosf::MessagesStreamingIter>(range.begin());
   ousterState_->osfEnd  = std::make_unique<sosf::MessagesStreamingIter>(range.end());
 }
@@ -488,9 +554,9 @@ void OusterDirectInput::setupOusterFromInfo()
   // Scan batcher
   ousterState_->batcher = std::make_unique<sc::ScanBatcher>(info);
 
-  // Allocate a LidarScan
-  ousterState_->scan = std::make_unique<sc::LidarScan>(
-      ousterState_->w, ousterState_->h, info.format.udp_profile_lidar);
+  // Allocate a LidarScan. Built from the sensor info so it also gets the
+  // number of columns per packet, which ScanBatcher checks on every packet.
+  ousterState_->scan = std::make_unique<sc::LidarScan>(info);
 
   // XYZ lookup table
   ousterState_->xyzLut = sc::make_xyz_lut(info, /*use_extrinsics=*/false);
@@ -961,204 +1027,391 @@ void OusterDirectInput::spinOnce()
       module_publish_diagnostics(diag);
     }
   }
-  else if (isOsfMode())
-  {
-    osfSpinOnce();
-  }
   else
   {
-    // PCAP replay: drive from spinOnce()
-    pcapSpinOnce();
+    replaySpinOnce();
   }
 }
 
 // ============================================================================
-// pcapSpinOnce: Drive PCAP replay at the configured pace
+// replaySpinOnce: Drive PCAP / OSF replay at the configured pace
 //
-// Uses the ouster_pcap stepwise API:
-//   next_packet_info(handle, info)  — peek at next packet's metadata
-//   read_packet(handle, buf, size)  — read the packet payload
-// Packets are distinguished by destination UDP port (lidar vs imu).
+// Never blocks: the replay time advances with the wall clock (times the
+// playback speed), and every scan whose time has come is published. The
+// next scan is decoded ahead and kept in pendingFrame_ until then.
 // ============================================================================
-void OusterDirectInput::pcapSpinOnce()
+void OusterDirectInput::replaySpinOnce()
 {
-  if (!ousterState_ || !ousterState_->pcapHandle)
+  auto         lckUI         = mrpt::lockHelper(dataset_ui_mtx_);
+  const double timeWarpScale = timeWarpScale_;
+  const bool   paused        = paused_;
+  const auto   teleportHere  = teleportHere_;
+  teleportHere_.reset();
+  lckUI.unlock();
+
+  const auto   tNow    = mrpt::Clock::now();
+  const double dtWall  = lastReplayWallclock_.has_value()
+                             ? mrpt::system::timeDifference(*lastReplayWallclock_, tNow)
+                             : 0.0;
+  lastReplayWallclock_ = tNow;
+
+  if (teleportHere.has_value() && *teleportHere < datasetUI_size())
+  {
+    // The scan at the new position is published right away, even if paused:
+    replaySeek(*teleportHere);
+  }
+  else if (paused)
   {
     return;
   }
 
-  auto& handle  = *(ousterState_->pcapHandle);
-  auto& batcher = *(ousterState_->batcher);
-  auto& scan    = *(ousterState_->scan);
-
-  const int lidarPort = ousterState_->pcapLidarPort;
-  const int imuPort   = ousterState_->pcapImuPort;
-
-  // Read packets from PCAP until we assemble one full LiDAR scan,
-  // then pace according to time_warp_scale.
-  bool gotScan = false;
-  while (!gotScan && !requestedShutdown())
+  if (!pendingFrame_)
   {
-    spc::PacketInfo pktInfo;
-    if (!spc::next_packet_info(handle, pktInfo))
-    {
-      // End of file
-      MRPT_LOG_INFO("End of PCAP file reached.");
-      onDatasetPlaybackEnds();
-      return;
-    }
+    pendingFrame_ = isOsfMode() ? readNextOsfFrame() : readNextPcapFrame();
+  }
+  if (!pendingFrame_)
+  {
+    MRPT_LOG_THROTTLE_INFO(10.0, "End of replayed file reached.");
+    onDatasetPlaybackEnds();
+    return;
+  }
 
-    const int  dstPort     = pktInfo.dst_port;
-    const auto payloadSize = static_cast<std::size_t>(pktInfo.payload_size);
+  // Replay as fast as possible: one scan per call.
+  if (timeWarpScale <= 0)
+  {
+    publishFrame(*pendingFrame_);
+    pendingFrame_.reset();
+    return;
+  }
 
-    if (dstPort == lidarPort && payloadSize <= ousterState_->lidarPkt.buf.size())
-    {
-      // Read lidar packet
-      const auto nRead = spc::read_packet(
-          handle, ousterState_->lidarPkt.buf.data(), ousterState_->lidarPkt.buf.size());
+  if (!replayTime_.has_value())
+  {
+    replayTime_ = pendingFrame_->t;  // (re)start: publish the first scan now
+  }
+  else if (!teleportHere.has_value())
+  {
+    *replayTime_ += dtWall * timeWarpScale;
+  }
 
-      if (nRead > 0)
-      {
-        if (batcher(ousterState_->lidarPkt, scan))
-        {
-          auto obs = scanToObservation(scan);
-          if (obs && obs->pointcloud && obs->pointcloud->size() > 0)
-          {
-            // Pace the replay
-            paceReplay(obs->timestamp);
-            sendObservationsToFrontEnds(obs);
-            gotScan = true;
-          }
-        }
-      }
-    }
-    else if (dstPort == imuPort && payloadSize <= ousterState_->imuPkt.buf.size())
-    {
-      // Read IMU packet
-      const auto nRead = spc::read_packet(
-          handle, ousterState_->imuPkt.buf.data(), ousterState_->imuPkt.buf.size());
-
-      if (nRead > 0)
-      {
-        auto obs = imuToObservation(ousterState_->imuPkt.buf.data());
-        if (obs)
-        {
-          sendObservationsToFrontEnds(obs);
-        }
-      }
-    }
-    else
-    {
-      // Unknown/unrelated packet — skip it
-      if (ousterState_->scratchBuf.size() < payloadSize + 1)
-      {
-        ousterState_->scratchBuf.resize(payloadSize + 1);
-      }
-      spc::read_packet(handle, ousterState_->scratchBuf.data(), ousterState_->scratchBuf.size());
-    }
+  while (pendingFrame_ && pendingFrame_->t <= *replayTime_ && !requestedShutdown())
+  {
+    publishFrame(*pendingFrame_);
+    pendingFrame_ = isOsfMode() ? readNextOsfFrame() : readNextPcapFrame();
   }
 }
 
+void OusterDirectInput::publishFrame(const ReplayFrame& frame)
+{
+  for (const auto& o : frame.obs)
+  {
+    sendObservationsToFrontEnds(o);
+  }
+
+  auto lck            = mrpt::lockHelper(dataset_ui_mtx_);
+  lastPublishedIndex_ = frame.index;
+  lastPublishedTime_  = frame.uiTime;
+}
+
 // ============================================================================
-// osfSpinOnce: Drive OSF replay at the configured pace
-//
-// Advances through the OSF message stream until one full LidarScan is
-// emitted, then paces according to time_warp_scale.
+// readNextPcapFrame: Read packets until one full LiDAR scan is assembled.
+// Packets are distinguished by destination UDP port (lidar vs imu).
+// Returns nullopt at the end of the file.
 // ============================================================================
-void OusterDirectInput::osfSpinOnce()
+std::optional<OusterDirectInput::ReplayFrame> OusterDirectInput::readNextPcapFrame()
+{
+  if (!ousterState_ || !ousterState_->pcapReader)
+  {
+    return {};
+  }
+
+  auto& reader = *(ousterState_->pcapReader);
+  auto& scan   = *(ousterState_->scan);
+
+  ReplayFrame frame;
+  while (!requestedShutdown() && reader.next_packet() != 0)
+  {
+    const auto& pktInfo = reader.current_info();
+    const auto  size    = pktInfo.payload_size;
+
+    if (pktInfo.dst_port == ousterState_->pcapLidarPort &&
+        size <= ousterState_->lidarPkt.buf.size())
+    {
+      const auto captureUs = static_cast<uint64_t>(pktInfo.timestamp.count());
+      if (!ousterState_->pcapFrameStartUs)
+      {
+        ousterState_->pcapFrameStartUs = captureUs;
+      }
+
+      std::memcpy(ousterState_->lidarPkt.buf.data(), reader.current_data(), size);
+      if (!(*ousterState_->batcher)(ousterState_->lidarPkt, scan))
+      {
+        continue;
+      }
+      // A scan is complete when the first packet of the next one arrives:
+      const uint64_t scanStartUs     = *ousterState_->pcapFrameStartUs;
+      ousterState_->pcapFrameStartUs = captureUs;
+
+      const size_t index = nextFrameIndex_++;
+
+      auto obs = scanToObservation(scan);
+      if (obs && obs->pointcloud && obs->pointcloud->size() > 0)
+      {
+        frame.t      = mrpt::Clock::toDouble(obs->timestamp);
+        frame.uiTime = 1e-6 * static_cast<double>(scanStartUs - ousterState_->pcapStartUs);
+        frame.index  = index;
+        frame.obs.push_back(obs);
+        return frame;
+      }
+    }
+    else if (
+        pktInfo.dst_port == ousterState_->pcapImuPort && size <= ousterState_->imuPkt.buf.size())
+    {
+      std::memcpy(ousterState_->imuPkt.buf.data(), reader.current_data(), size);
+      if (auto obs = imuToObservation(ousterState_->imuPkt.buf.data()); obs)
+      {
+        frame.obs.push_back(obs);
+      }
+    }
+  }
+  return {};
+}
+
+// ============================================================================
+// readNextOsfFrame: Advance through the OSF LidarScan stream until one scan
+// is decoded. Returns nullopt at the end of the file.
+// ============================================================================
+std::optional<OusterDirectInput::ReplayFrame> OusterDirectInput::readNextOsfFrame()
 {
   if (!ousterState_ || !ousterState_->osfIter || !ousterState_->osfEnd)
   {
-    return;
+    return {};
   }
 
   auto& it  = *(ousterState_->osfIter);
   auto& end = *(ousterState_->osfEnd);
 
-  bool gotScan = false;
-  while (!gotScan && it != end && !requestedShutdown())
+  ReplayFrame frame;
+  while (it != end && !requestedShutdown())
   {
-    auto msg = *it;
+    const auto msg = *it;
     ++it;
 
-    if (msg.is<sosf::LidarScanStream>())
+    if (!msg.is<sosf::LidarScanStream>())
     {
-      auto scan = msg.decode_msg<sosf::LidarScanStream>();
-      if (scan)
+      continue;
+    }
+    const size_t index = nextFrameIndex_++;
+
+    auto scan = msg.decode_msg<sosf::LidarScanStream>();
+    if (!scan)
+    {
+      continue;
+    }
+
+    // Emit IMU observations from embedded IMU fields (ACCEL32_GYRO32_NMEA
+    // profile stores multiple IMU samples per LidarScan).
+    // IMU_ACC is in m/s² and IMU_GYRO is in rad/s (non-legacy profile).
+    if (scan->has_field(sc::ChanField::IMU_TIMESTAMP) && scan->has_field(sc::ChanField::IMU_ACC) &&
+        scan->has_field(sc::ChanField::IMU_GYRO))
+    {
+      const sc::ArrayView1<uint64_t> imuTs   = scan->field(sc::ChanField::IMU_TIMESTAMP);
+      const sc::ArrayView2<float>    imuAcc  = scan->field(sc::ChanField::IMU_ACC);
+      const sc::ArrayView2<float>    imuGyro = scan->field(sc::ChanField::IMU_GYRO);
+
+      for (std::size_t i = 0; i < imuTs.shape[0]; ++i)
       {
-        // Emit IMU observations from embedded IMU fields (ACCEL32_GYRO32_NMEA
-        // profile stores multiple IMU samples per LidarScan).
-        // IMU_ACC is in m/s² and IMU_GYRO is in rad/s (non-legacy profile).
-        if (scan->has_field(sc::ChanField::IMU_TIMESTAMP) &&
-            scan->has_field(sc::ChanField::IMU_ACC) && scan->has_field(sc::ChanField::IMU_GYRO))
+        if (imuTs(i) == 0)
         {
-          const sc::ArrayView1<uint64_t> imuTs   = scan->field(sc::ChanField::IMU_TIMESTAMP);
-          const sc::ArrayView2<float>    imuAcc  = scan->field(sc::ChanField::IMU_ACC);
-          const sc::ArrayView2<float>    imuGyro = scan->field(sc::ChanField::IMU_GYRO);
-
-          for (std::size_t i = 0; i < imuTs.shape[0]; ++i)
-          {
-            if (imuTs(i) == 0)
-            {
-              continue;  // slot not filled (e.g. a partial first scan)
-            }
-            auto imuObs         = mrpt::obs::CObservationIMU::Create();
-            imuObs->sensorLabel = params_.imu_sensor_label;
-            imuObs->sensorPose  = resolvedImuPose_;
-            imuObs->timestamp   = ousterTsToMrpt(imuTs(i));
-
-            imuObs->set(mrpt::obs::IMU_X_ACC, static_cast<double>(imuAcc(i, 0)));
-            imuObs->set(mrpt::obs::IMU_Y_ACC, static_cast<double>(imuAcc(i, 1)));
-            imuObs->set(mrpt::obs::IMU_Z_ACC, static_cast<double>(imuAcc(i, 2)));
-            imuObs->set(mrpt::obs::IMU_WX, static_cast<double>(imuGyro(i, 0)));
-            imuObs->set(mrpt::obs::IMU_WY, static_cast<double>(imuGyro(i, 1)));
-            imuObs->set(mrpt::obs::IMU_WZ, static_cast<double>(imuGyro(i, 2)));
-
-            sendObservationsToFrontEnds(imuObs);
-          }
+          continue;  // slot not filled (e.g. a partial first scan)
         }
+        auto imuObs         = mrpt::obs::CObservationIMU::Create();
+        imuObs->sensorLabel = params_.imu_sensor_label;
+        imuObs->sensorPose  = resolvedImuPose_;
+        imuObs->timestamp   = ousterTsToMrpt(imuTs(i));
 
-        auto obs = scanToObservation(*scan);
-        if (obs && obs->pointcloud && obs->pointcloud->size() > 0)
-        {
-          paceReplay(obs->timestamp);
-          sendObservationsToFrontEnds(obs);
-          gotScan = true;
-        }
+        imuObs->set(mrpt::obs::IMU_X_ACC, static_cast<double>(imuAcc(i, 0)));
+        imuObs->set(mrpt::obs::IMU_Y_ACC, static_cast<double>(imuAcc(i, 1)));
+        imuObs->set(mrpt::obs::IMU_Z_ACC, static_cast<double>(imuAcc(i, 2)));
+        imuObs->set(mrpt::obs::IMU_WX, static_cast<double>(imuGyro(i, 0)));
+        imuObs->set(mrpt::obs::IMU_WY, static_cast<double>(imuGyro(i, 1)));
+        imuObs->set(mrpt::obs::IMU_WZ, static_cast<double>(imuGyro(i, 2)));
+
+        frame.obs.push_back(imuObs);
       }
     }
 
-    if (it == end)
+    auto obs = scanToObservation(*scan);
+    if (obs && obs->pointcloud && obs->pointcloud->size() > 0)
     {
-      MRPT_LOG_INFO("End of OSF file reached.");
-      onDatasetPlaybackEnds();
+      frame.t      = mrpt::Clock::toDouble(obs->timestamp);
+      frame.uiTime = 1e-9 * static_cast<double>((msg.ts() - ousterState_->osfStartTs).count());
+      frame.index  = index;
+      frame.obs.push_back(obs);
+      return frame;
+    }
+  }
+  return {};
+}
+
+// ============================================================================
+// replaySeek: Continue replaying from the given scan number
+// ============================================================================
+void OusterDirectInput::replaySeek(size_t frameIndex)
+{
+  if (isOsfMode())
+  {
+    auto& reader = *(ousterState_->osfReader);
+
+    std::optional<sosf::ts_t> ts;
+    if (reader.has_message_idx())
+    {
+      const auto t =
+          reader.ts_by_message_idx(ousterState_->osfStreamId, static_cast<uint32_t>(frameIndex));
+      if (t.has_value())
+      {
+        ts = *t;
+      }
+    }
+    if (!ts.has_value())
+    {
+      // Without a per-message index, assume evenly spaced scans:
+      const auto   N    = std::max<uint64_t>(2, ousterState_->osfScanCount);
+      const double frac = static_cast<double>(frameIndex) / static_cast<double>(N - 1);
+      const auto   span = ousterState_->osfEndTs - ousterState_->osfStartTs;
+      ts                = ousterState_->osfStartTs +
+           sosf::ts_t(static_cast<int64_t>(frac * static_cast<double>(span.count())));
+    }
+    osfStartReadingAt(*ts);
+  }
+  else
+  {
+    ousterState_->pcapReader->seek(pcapFrameOffsets_.at(frameIndex));
+    ousterState_->pcapFrameStartUs.reset();
+  }
+
+  // Drop any partially assembled scan from the previous position:
+  ousterState_->batcher = std::make_unique<sc::ScanBatcher>(ousterState_->info);
+  ousterState_->scan    = std::make_unique<sc::LidarScan>(ousterState_->info);
+
+  nextFrameIndex_ = frameIndex;
+  pendingFrame_.reset();
+  replayTime_.reset();
+}
+
+// ============================================================================
+// pcapIndexThreadFunc: Find where each scan starts in the PCAP file, so the
+// replay can jump to any of them. A full pass over the file, hence done in
+// the background while the replay goes on.
+// ============================================================================
+void OusterDirectInput::pcapIndexThreadFunc()
+{
+  try
+  {
+    spc::IndexedPcapReader reader(
+        params_.pcap_file, std::vector<sc::SensorInfo>{ousterState_->info});
+
+    uint64_t lastUs = ousterState_->pcapStartUs;
+    while (!pcapIndexAbort_ && !requestedShutdown() && reader.next_packet() != 0)
+    {
+      reader.update_index_for_current_packet();
+      lastUs = static_cast<uint64_t>(reader.current_info().timestamp.count());
+    }
+    if (pcapIndexAbort_ || requestedShutdown())
+    {
       return;
     }
+
+    pcapFrameOffsets_ = reader.get_index().frame_indices.at(0);
+    pcapTotalTime_    = 1e-6 * static_cast<double>(lastUs - ousterState_->pcapStartUs);
+    pcapIndexReady_   = true;
+
+    MRPT_LOG_INFO_FMT("PCAP indexed: %zu scans, %.1f s.", pcapFrameOffsets_.size(), pcapTotalTime_);
   }
-}
-
-// ============================================================================
-// paceReplay: Enforce time_warp_scale pacing for PCAP replay
-// ============================================================================
-void OusterDirectInput::paceReplay(const mrpt::Clock::time_point& obsTimestamp)
-{
-  const double datasetTime = mrpt::Clock::toDouble(obsTimestamp);
-
-  if (pcapLastWallclock_.has_value() && params_.time_warp_scale > 0)
+  catch (const std::exception& e)
   {
-    const double dtDataset = datasetTime - pcapLastDatasetTime_;
-    const double dtWall    = dtDataset / params_.time_warp_scale;
-
-    const auto   now     = mrpt::Clock::now();
-    const double elapsed = mrpt::system::timeDifference(pcapLastWallclock_.value(), now);
-
-    if (elapsed < dtWall)
-    {
-      const double sleepSec = dtWall - elapsed;
-      std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(sleepSec * 1e6)));
-    }
+    MRPT_LOG_WARN_STREAM(
+        "Could not index the PCAP file, no playback UI will be available:\n"
+        << mrpt::exception_to_str(e));
   }
-
-  pcapLastWallclock_   = mrpt::Clock::now();
-  pcapLastDatasetTime_ = datasetTime;
 }
+
+// ============================================================================
+// Dataset_UI
+// ============================================================================
+#if defined(MOLA_KERNEL_DATASET_UI_HAS_ENABLED)
+bool OusterDirectInput::datasetUI_enabled() const
+{
+  // A live sensor has no position nor duration to control:
+  if (isLiveMode())
+  {
+    return false;
+  }
+  return isOsfMode() || pcapIndexReady_;
+}
+#endif
+
+size_t OusterDirectInput::datasetUI_size() const
+{
+  if (isOsfMode())
+  {
+    return ousterState_ ? static_cast<size_t>(ousterState_->osfScanCount) : 0;
+  }
+  return pcapIndexReady_ ? pcapFrameOffsets_.size() : 0;
+}
+
+size_t OusterDirectInput::datasetUI_lastQueriedTimestep() const
+{
+  auto lck = mrpt::lockHelper(dataset_ui_mtx_);
+  return lastPublishedIndex_;
+}
+
+double OusterDirectInput::datasetUI_playback_speed() const
+{
+  auto lck = mrpt::lockHelper(dataset_ui_mtx_);
+  return timeWarpScale_;
+}
+
+void OusterDirectInput::datasetUI_playback_speed(double speed)
+{
+  auto lck       = mrpt::lockHelper(dataset_ui_mtx_);
+  timeWarpScale_ = speed;
+}
+
+bool OusterDirectInput::datasetUI_paused() const
+{
+  auto lck = mrpt::lockHelper(dataset_ui_mtx_);
+  return paused_;
+}
+
+void OusterDirectInput::datasetUI_paused(bool paused)
+{
+  auto lck = mrpt::lockHelper(dataset_ui_mtx_);
+  paused_  = paused;
+}
+
+void OusterDirectInput::datasetUI_teleport(size_t timestep)
+{
+  auto lck      = mrpt::lockHelper(dataset_ui_mtx_);
+  teleportHere_ = timestep;
+}
+
+#if defined(MOLA_KERNEL_DATASET_UI_HAS_TIME)
+std::optional<double> OusterDirectInput::datasetUI_time() const
+{
+  auto lck = mrpt::lockHelper(dataset_ui_mtx_);
+  return lastPublishedTime_;
+}
+
+std::optional<double> OusterDirectInput::datasetUI_total_time() const
+{
+  if (isOsfMode() && ousterState_)
+  {
+    return 1e-9 * static_cast<double>((ousterState_->osfEndTs - ousterState_->osfStartTs).count());
+  }
+  if (!isLiveMode() && pcapIndexReady_)
+  {
+    return pcapTotalTime_;
+  }
+  return std::nullopt;
+}
+#endif

@@ -41,6 +41,7 @@ modules:
       pcap_file: "${OUSTER_PCAP}"
       metadata_json: "${OUSTER_META}"
       time_warp_scale: ${MOLA_TIME_WARP|1.0}
+      start_paused: ${MOLA_DATASET_START_PAUSED|false}
       decimate_columns: ${OUSTER_DECIMATE_COLUMNS|1}
       decimate_rows: ${OUSTER_DECIMATE_ROWS|1}
 

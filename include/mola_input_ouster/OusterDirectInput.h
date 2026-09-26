@@ -18,12 +18,15 @@
  */
 #pragma once
 
+#include <mola_kernel/interfaces/Dataset_UI.h>
 #include <mola_kernel/interfaces/RawDataSourceBase.h>
 #include <mrpt/obs/CObservationIMU.h>
 #include <mrpt/obs/CObservationPointCloud.h>
 #include <mrpt/poses/CPose3D.h>
 
 #include <atomic>
+#include <chrono>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -79,11 +82,18 @@ namespace mola
  *
  *  ## PCAP replay mode
  *  Set `pcap_file` and `metadata_json` to replay a recorded capture.
+ *  The file is indexed in a background thread at startup; the playback
+ *  panel (see below) shows up once that finishes.
  *
  *  ## OSF replay mode
  *  Set `osf_file` to replay an Ouster `.osf` recording. Sensor metadata and
  *  scan geometry are read directly from the OSF file; no separate metadata JSON
  *  is required.
+ *
+ *  ## Playback panel
+ *  In PCAP and OSF replay modes, this module implements mola::Dataset_UI, so
+ *  the MOLA GUI shows a panel to pause, change the replay speed and jump to
+ *  any scan. There is no such panel in live mode.
  *
  *  ## YAML parameters
  *  ```yaml
@@ -102,6 +112,9 @@ namespace mola
  *    # --- OSF replay mode ---
  *    osf_file: "/path/to/recording.osf"
  *    time_warp_scale: 1.0
+ *
+ *    # --- Replay (PCAP / OSF) ---
+ *    start_paused: false
  *
  *    # --- Scan decimation (all modes): keep every N-th column / row ---
  *    decimate_columns: 1
@@ -132,7 +145,7 @@ namespace mola
  *
  * \ingroup mola_input_ouster_grp
  */
-class OusterDirectInput : public RawDataSourceBase
+class OusterDirectInput : public RawDataSourceBase, public Dataset_UI
 {
   DEFINE_MRPT_OBJECT(OusterDirectInput, mola)
 
@@ -151,6 +164,22 @@ class OusterDirectInput : public RawDataSourceBase
 
   // See docs in base class
   void onQuit() override;
+
+  // Dataset_UI, only meaningful in PCAP / OSF replay modes:
+#if defined(MOLA_KERNEL_DATASET_UI_HAS_ENABLED)
+  bool datasetUI_enabled() const override;
+#endif
+  size_t datasetUI_size() const override;
+  size_t datasetUI_lastQueriedTimestep() const override;
+  double datasetUI_playback_speed() const override;
+  void   datasetUI_playback_speed(double speed) override;
+  bool   datasetUI_paused() const override;
+  void   datasetUI_paused(bool paused) override;
+  void   datasetUI_teleport(size_t timestep) override;
+#if defined(MOLA_KERNEL_DATASET_UI_HAS_TIME)
+  std::optional<double> datasetUI_time() const override;
+  std::optional<double> datasetUI_total_time() const override;
+#endif
 
  protected:
   // See docs in base class
@@ -174,6 +203,7 @@ class OusterDirectInput : public RawDataSourceBase
     std::string osf_file;
 
     double time_warp_scale = 1.0;
+    bool   start_paused    = false;
 
     // Keep only every N-th column / row of each scan (1 = all). Meant for
     // high-resolution sensors, whose full scans are more than LiDAR odometry
@@ -218,19 +248,49 @@ class OusterDirectInput : public RawDataSourceBase
   void initLiveMode();
   void initPcapMode();
   void initOsfMode();
+  void osfStartReadingAt(const std::chrono::nanoseconds& startTs);
 
   // ---- Live receiver thread ----
   std::thread       receiverThread_;
   std::atomic<bool> receiverRunning_{false};
   void              receiverThreadFunc();
 
-  // ---- PCAP replay state ----
-  std::optional<mrpt::Clock::time_point> pcapLastWallclock_;
-  double                                 pcapLastDatasetTime_ = 0;
+  // ---- Replay (PCAP / OSF) ----
+  /// One scan, plus the IMU readings found before it, waiting for its turn.
+  struct ReplayFrame
+  {
+    double                                    t      = 0;  //!< Scan time [s], for pacing
+    double                                    uiTime = 0;  //!< [s] since the dataset start
+    size_t                                    index  = 0;  //!< Scan number in the file
+    std::vector<mrpt::obs::CObservation::Ptr> obs;
+  };
+  std::optional<ReplayFrame>             pendingFrame_;
+  std::optional<double>                  replayTime_;  //!< Same clock as ReplayFrame::t
+  std::optional<mrpt::Clock::time_point> lastReplayWallclock_;
+  size_t                                 nextFrameIndex_ = 0;
 
-  void pcapSpinOnce();
-  void osfSpinOnce();
-  void paceReplay(const mrpt::Clock::time_point& obsTimestamp);
+  void                       replaySpinOnce();
+  std::optional<ReplayFrame> readNextPcapFrame();
+  std::optional<ReplayFrame> readNextOsfFrame();
+  void                       replaySeek(size_t frameIndex);
+  void                       publishFrame(const ReplayFrame& frame);
+
+  // PCAP frame index (scan number -> file offset), built in the background.
+  // Only read once pcapIndexReady_ is set.
+  std::thread           pcapIndexThread_;
+  std::atomic<bool>     pcapIndexAbort_{false};
+  std::atomic<bool>     pcapIndexReady_{false};
+  std::vector<uint64_t> pcapFrameOffsets_;
+  double                pcapTotalTime_ = 0;
+  void                  pcapIndexThreadFunc();
+
+  // ---- Dataset_UI state, guarded by dataset_ui_mtx_ ----
+  mutable std::mutex    dataset_ui_mtx_;
+  double                timeWarpScale_ = 1.0;
+  bool                  paused_        = false;
+  std::optional<size_t> teleportHere_;
+  size_t                lastPublishedIndex_ = 0;
+  std::optional<double> lastPublishedTime_;
 
   // ---- Conversions ----
   mrpt::obs::CObservationPointCloud::Ptr scanToObservation(
