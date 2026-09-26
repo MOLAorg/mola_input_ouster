@@ -1081,6 +1081,7 @@ void OusterDirectInput::replaySpinOnce()
   {
     publishFrame(*pendingFrame_);
     pendingFrame_.reset();
+    replayTime_.reset();  // re-anchor if the speed becomes positive again
     return;
   }
 
@@ -1093,8 +1094,17 @@ void OusterDirectInput::replaySpinOnce()
     *replayTime_ += dtWall * timeWarpScale;
   }
 
+  // Bounded, so a replay slower than the requested speed does not build up an
+  // ever-growing backlog (and stays responsive to pause and seek):
+  constexpr size_t MAX_SCANS_PER_CALL = 5;
+  size_t           nPublished         = 0;
   while (pendingFrame_ && pendingFrame_->t <= *replayTime_ && !requestedShutdown())
   {
+    if (nPublished++ == MAX_SCANS_PER_CALL)
+    {
+      *replayTime_ = pendingFrame_->t;  // drop the lag
+      break;
+    }
     publishFrame(*pendingFrame_);
     pendingFrame_ = isOsfMode() ? readNextOsfFrame() : readNextPcapFrame();
   }
