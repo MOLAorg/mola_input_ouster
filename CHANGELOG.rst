@@ -2,8 +2,8 @@
 Changelog for package mola_input_ouster
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Forthcoming
------------
+0.2.0 (2026-10-01)
+------------------
 * ci: make scripts/release.py identical across repos by auto-discovering packages
 * fix .gitignore: anchor build-* to directories only
 * ci: add clang-format and colcon build workflows
