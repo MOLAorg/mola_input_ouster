@@ -109,7 +109,7 @@ if(NOT OusterSDK_FOUND)
         # the header for every TU that belongs to the ouster_pcap target.
         if(TARGET ouster_pcap)
             target_compile_options(ouster_pcap PRIVATE
-                $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-include;cstdint>)
+                "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:SHELL:-include cstdint>")
         endif()
     else()
         message(FATAL_ERROR
